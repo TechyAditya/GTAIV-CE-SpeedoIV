@@ -12,7 +12,6 @@ if (-not $GCC) {
            Select-Object -ExpandProperty Source
 }
 if (-not $GCC) {
-    # Check winget-installed MinGW
     $wingetPkg = "$env:TEMP\opencode\mingw32\mingw32\bin\g++.exe"
     if (Test-Path $wingetPkg) { $GCC = $wingetPkg }
 }
@@ -22,7 +21,6 @@ if (-not $GCC) {
 }
 
 Write-Host "Using GCC: $GCC"
-
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $src = Join-Path $PSScriptRoot "speedometer.cpp"
@@ -33,15 +31,11 @@ $gamePlugins = "J:\Games\Grand Theft Auto IV - The Complete Edition\plugins"
     -shared `
     -o $out `
     -std=c++17 `
-    -O2 `
-    -s `
-    -static `
-    -ld3d9 `
-    -lgdi32 `
-    -luser32 `
-    -lkernel32 `
-    -Wl,--kill-at `
-    -DUNICODE -D_UNICODE
+    -O2 -s -static `
+    -I $PSScriptRoot `
+    -ld3dx9_40 -ld3d9 `
+    -lgdi32 -luser32 -lkernel32 `
+    -Wl,--kill-at
 
 if ($LASTEXITCODE -eq 0) {
     $size = (Get-Item $out).Length / 1KB
