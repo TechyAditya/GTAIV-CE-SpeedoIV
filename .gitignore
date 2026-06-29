@@ -1,0 +1,8 @@
+*.o
+*.obj
+*.dll
+*.asi
+*.exe
+*.log
+*.pdb
+build/
