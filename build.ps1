@@ -27,6 +27,7 @@ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $src = Join-Path $PSScriptRoot "speedometer.cpp"
 $out = Join-Path $OutDir "SpeedoIV-CE.asi"
+$gamePlugins = "J:\Games\Grand Theft Auto IV - The Complete Edition\plugins"
 
 & $GCC $src `
     -shared `
@@ -45,6 +46,10 @@ $out = Join-Path $OutDir "SpeedoIV-CE.asi"
 if ($LASTEXITCODE -eq 0) {
     $size = (Get-Item $out).Length / 1KB
     Write-Host "Build OK: $out ($([math]::Round($size,1)) KB)"
+    if (Test-Path $gamePlugins) {
+        Copy-Item $out (Join-Path $gamePlugins "SpeedoIV-CE.asi") -Force
+        Write-Host "Installed to: $gamePlugins\SpeedoIV-CE.asi"
+    }
 } else {
     Write-Error "Build failed."
     exit 1

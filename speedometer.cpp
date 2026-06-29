@@ -1,181 +1,153 @@
 /*
- * SpeedoIV-CE - Simple Speedometer for GTA IV Complete Edition (1.2.0.43)
+ * SpeedoIV-CE - Speedometer for GTA IV Complete Edition (1.2.0.43)
  *
- * A lightweight ASI plugin that displays vehicle speed as a text HUD overlay.
- * Compatible with FusionFix (DXVK) and the Complete Edition.
+ * Port of the original SpeedoIV by o!nko!nk with the "retarded_chicken" skin.
+ * Compatible with FusionFix (DXVK) -- uses inline hook on game's Present call
+ * to obtain the real D3D9 device, then renders using D3DX9 sprites.
  *
- * Rendering: Uses a transparent Win32 overlay window (WS_EX_LAYERED +
- * WS_EX_TRANSPARENT) drawn on top of the game window. This avoids any
- * D3D9/DXVK hooking conflicts with FusionFix.
- *
- * Game data: Pattern-scans GTAIV.exe for CPedFactory to read vehicle speed.
- *
- * Built with MinGW GCC (i686).
+ * No ScriptHook dependency. Vehicle speed read via pattern-scanned memory.
+ * Built with MinGW GCC (i686) + d3dx9_40.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#define _USE_MATH_DEFINES
 #include <windows.h>
+#include <d3d9.h>
+#include <d3dx9.h>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* --------------------------------------------------------------------------
- * Configuration
+ * Configuration (matches original SpeedoIV Config.ini format)
  * -------------------------------------------------------------------------- */
-static const int   FONT_SIZE           = 30;
-static const char  FONT_NAME[]         = "Consolas";
-static const int   MARGIN_RIGHT        = 185;   /* px from right edge       */
-static const int   MARGIN_BOTTOM       = 55;    /* px from bottom edge      */
-static const COLORREF TEXT_COLOR       = RGB(255, 255, 255);
-static const COLORREF SHADOW_COLOR     = RGB(0, 0, 0);
-static const COLORREF BG_COLOR         = RGB(30, 30, 30);
-static const BYTE     BG_ALPHA         = 180;   /* background opacity 0-255 */
-static const float KMH_MULTIPLIER      = 3.6f;  /* m/s -> km/h              */
-static const int   OVERLAY_FPS         = 30;    /* refresh rate of overlay  */
+struct SpeedoConfig {
+    bool  autostart;
+    int   toggleKey;     /* VK code (default 116 = F5) */
+    float texSizeX, texSizeY;
+    bool  enableKMH;     /* false = MPH display, true = KMH */
+    float maxSpeed;
+    char  screenAlign[4]; /* BL, BR, TL, TR */
+    float posX, posY;
+    float sizeX, sizeY;
+    float angle;
+    int   alpha;
+    char  skinFolder[64];
+};
+
+static SpeedoConfig g_cfg = {
+    true, VK_F5,
+    300.0f, 300.0f,
+    true, 300.0f,
+    "BL",
+    26.5f, -3.0f,
+    242.0f, 234.0f,
+    0.0f, 240,
+    "Default"
+};
 
 /* --------------------------------------------------------------------------
  * Globals
  * -------------------------------------------------------------------------- */
-static HMODULE   g_hModule     = NULL;
-static HWND      g_hOverlay    = NULL;
-static HWND      g_hGameWnd    = NULL;
-static HFONT     g_hFont       = NULL;
-static bool      g_showSpeedo  = true;
-static bool      g_running     = true;
+static HMODULE g_hModule       = NULL;
+static bool    g_showSpeedo    = true;
+static bool    g_running       = true;
+static bool    g_initialized   = false;
+
+/* D3D9 rendering */
+static IDirect3DDevice9*  g_pDevice   = NULL;
+static ID3DXSprite*       g_pSprite   = NULL;
+static IDirect3DTexture9* g_pTexBck   = NULL;
+static IDirect3DTexture9* g_pTexPin   = NULL;
+static ID3DXFont*         g_pFont     = NULL;
+static bool               g_d3dReady  = false;
 
 /* Game memory */
 static uintptr_t g_gameBase    = 0;
 static uintptr_t g_gameSize    = 0;
 
+/* Inline hook */
+static uintptr_t g_hookAddr    = 0;
+static BYTE      g_origBytes[16];
+static bool      g_hooked      = false;
+
 /* --------------------------------------------------------------------------
- * Safe memory reading (GCC-compatible, no SEH)
+ * Safe memory helpers
  * -------------------------------------------------------------------------- */
-static inline bool IsReadable(const void* addr, size_t len) {
-    return !IsBadReadPtr(addr, len);
+static inline bool IsReadable(const void* a, size_t n) { return !IsBadReadPtr(a, n); }
+static inline bool SafeReadPtr(uintptr_t a, uintptr_t* o) {
+    if (!IsReadable((void*)a, 4)) return false; *o = *(uintptr_t*)a; return true;
 }
-static inline bool SafeReadPtr(uintptr_t addr, uintptr_t* out) {
-    if (!IsReadable((const void*)addr, sizeof(uintptr_t))) return false;
-    *out = *(uintptr_t*)addr;
-    return true;
+static inline bool SafeReadFloat(uintptr_t a, float* o) {
+    if (!IsReadable((void*)a, 4)) return false; *o = *(float*)a; return true;
 }
-static inline bool SafeReadFloat(uintptr_t addr, float* out) {
-    if (!IsReadable((const void*)addr, sizeof(float))) return false;
-    *out = *(float*)addr;
-    return true;
-}
-static inline bool IsValidPtr(uintptr_t p) {
-    return p > 0x10000 && p < 0x7FFFFFFF;
-}
+static inline bool IsValidPtr(uintptr_t p) { return p > 0x10000 && p < 0x7FFFFFFF; }
+static inline bool IsHeapPtr(uintptr_t p) { return p >= 0x04000000 && p < 0x7FFFFFFF; }
 
 /* --------------------------------------------------------------------------
  * Pattern Scanner
  * -------------------------------------------------------------------------- */
 static uintptr_t FindPattern(uintptr_t base, size_t size,
-                             const BYTE* pattern, const char* mask) {
-    size_t patLen = strlen(mask);
-    if (size < patLen) return 0;
-    for (size_t i = 0; i <= size - patLen; i++) {
-        bool match = true;
-        for (size_t j = 0; j < patLen; j++) {
-            if (mask[j] == 'x' && ((const BYTE*)(base + i))[j] != pattern[j]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return base + i;
+                             const BYTE* pat, const char* mask) {
+    size_t plen = strlen(mask);
+    if (size < plen) return 0;
+    for (size_t i = 0; i <= size - plen; i++) {
+        bool ok = true;
+        for (size_t j = 0; j < plen && ok; j++)
+            if (mask[j] == 'x' && ((BYTE*)(base+i))[j] != pat[j]) ok = false;
+        if (ok) return base + i;
     }
     return 0;
 }
 
 /* --------------------------------------------------------------------------
- * Vehicle Speed Reading
+ * Vehicle Speed (same proven logic from debug_scan)
  * -------------------------------------------------------------------------- */
 static const int OFF_PEDFACTORY_PLAYER = 0x4;
 static const int VEHICLE_OFFSETS[]  = { 0x32C, 0x330, 0x328, 0x33C, 0x320 };
-static const int VELOCITY_OFFSETS[] = { 0x70,  0x80,  0x90,  0x60         };
-static const int NUM_VEH_OFFS  = sizeof(VEHICLE_OFFSETS)  / sizeof(int);
-static const int NUM_VEL_OFFS  = sizeof(VELOCITY_OFFSETS) / sizeof(int);
+static const int VELOCITY_OFFSETS[] = { 0x70, 0x80, 0x90, 0x60 };
+static const int NUM_VEH_OFFS = 5, NUM_VEL_OFFS = 4;
 
-static uintptr_t g_pPedFactory  = 0;
-static int       g_vehicleOff   = 0;
-static int       g_velocityOff  = 0;
-static bool      g_offsetsFound = false;
-
-static inline bool IsHeapPtr(uintptr_t p) {
-    /* Heap pointers in GTA IV CE are well above the image base (~0x00FE0000)
-     * and well above the end of static data. Real heap/pool objects live
-     * above ~0x04000000 typically. Filter out small values and static data. */
-    return p >= 0x04000000 && p < 0x7FFFFFFF;
-}
+static uintptr_t g_pPedFactory = 0;
+static int g_vehicleOff = 0, g_velocityOff = 0;
+static bool g_offsetsFound = false;
 
 static bool TryFactory(uintptr_t ptrAddr) {
     if (!IsValidPtr(ptrAddr)) return false;
-    uintptr_t factoryPtr = 0;
-    if (!SafeReadPtr(ptrAddr, &factoryPtr) || !IsHeapPtr(factoryPtr))
-        return false;
-
-    /* Factory should have a vtable pointer at offset 0 */
-    uintptr_t vtable = 0;
-    if (!SafeReadPtr(factoryPtr, &vtable) || !IsValidPtr(vtable))
-        return false;
-
-    /* Player ped pointer at +4 must be a heap pointer */
-    uintptr_t pedPtr = 0;
-    if (!SafeReadPtr(factoryPtr + OFF_PEDFACTORY_PLAYER, &pedPtr) ||
-        !IsHeapPtr(pedPtr))
-        return false;
-
-    /* The ped itself should have a vtable */
-    uintptr_t pedVtable = 0;
-    if (!SafeReadPtr(pedPtr, &pedVtable) || !IsValidPtr(pedVtable))
-        return false;
+    uintptr_t fp = 0;
+    if (!SafeReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return false;
+    uintptr_t vt = 0;
+    if (!SafeReadPtr(fp, &vt) || !IsValidPtr(vt)) return false;
+    uintptr_t ped = 0;
+    if (!SafeReadPtr(fp + OFF_PEDFACTORY_PLAYER, &ped) || !IsHeapPtr(ped)) return false;
+    uintptr_t pedVt = 0;
+    if (!SafeReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
 
     for (int v = 0; v < NUM_VEH_OFFS; v++) {
-        uintptr_t vehPtr = 0;
-        if (!SafeReadPtr(pedPtr + VEHICLE_OFFSETS[v], &vehPtr))
-            continue;
-        /* Vehicle: either 0 (on foot) or a valid heap pointer with vtable */
-        if (vehPtr == 0) {
-            /* Accept on-foot state only if this is the only "clean" match */
-            g_pPedFactory  = ptrAddr;
-            g_vehicleOff   = VEHICLE_OFFSETS[v];
-            g_velocityOff  = 0x70;
-            g_offsetsFound = true;
-            return true;
+        uintptr_t veh = 0;
+        if (!SafeReadPtr(ped + VEHICLE_OFFSETS[v], &veh)) continue;
+        if (veh == 0) {
+            g_pPedFactory = ptrAddr; g_vehicleOff = VEHICLE_OFFSETS[v];
+            g_velocityOff = 0x70; g_offsetsFound = true; return true;
         }
-        if (IsHeapPtr(vehPtr)) {
-            uintptr_t vehVtable = 0;
-            if (!SafeReadPtr(vehPtr, &vehVtable) || !IsValidPtr(vehVtable))
-                continue;
-            /* Final validation: velocity at +0x70 should be small floats */
-            float vx = 0, vy = 0, vz = 0;
-            if (SafeReadFloat(vehPtr + 0x70, &vx) &&
-                SafeReadFloat(vehPtr + 0x74, &vy) &&
-                SafeReadFloat(vehPtr + 0x78, &vz)) {
-                float spd = sqrtf(vx*vx + vy*vy + vz*vz) * KMH_MULTIPLIER;
-                if (spd >= 0.0f && spd <= 500.0f) {
-                    g_pPedFactory  = ptrAddr;
-                    g_vehicleOff   = VEHICLE_OFFSETS[v];
-                    g_velocityOff  = 0x70;
-                    g_offsetsFound = true;
+        if (!IsHeapPtr(veh)) continue;
+        uintptr_t vehVt = 0;
+        if (!SafeReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
+        float vx, vy, vz;
+        for (int vi = 0; vi < NUM_VEL_OFFS; vi++) {
+            uintptr_t vb = veh + VELOCITY_OFFSETS[vi];
+            if (SafeReadFloat(vb, &vx) && SafeReadFloat(vb+4, &vy) && SafeReadFloat(vb+8, &vz)) {
+                float s = sqrtf(vx*vx+vy*vy+vz*vz) * 3.6f;
+                if (s >= 0.0f && s <= 500.0f) {
+                    g_pPedFactory = ptrAddr; g_vehicleOff = VEHICLE_OFFSETS[v];
+                    g_velocityOff = VELOCITY_OFFSETS[vi]; g_offsetsFound = true;
                     return true;
-                }
-            }
-            /* Try other velocity offsets */
-            for (int vi = 0; vi < NUM_VEL_OFFS; vi++) {
-                if (SafeReadFloat(vehPtr + VELOCITY_OFFSETS[vi], &vx) &&
-                    SafeReadFloat(vehPtr + VELOCITY_OFFSETS[vi] + 4, &vy) &&
-                    SafeReadFloat(vehPtr + VELOCITY_OFFSETS[vi] + 8, &vz)) {
-                    float spd = sqrtf(vx*vx + vy*vy + vz*vz) * KMH_MULTIPLIER;
-                    if (spd >= 0.0f && spd <= 500.0f) {
-                        g_pPedFactory  = ptrAddr;
-                        g_vehicleOff   = VEHICLE_OFFSETS[v];
-                        g_velocityOff  = VELOCITY_OFFSETS[vi];
-                        g_offsetsFound = true;
-                        return true;
-                    }
                 }
             }
         }
@@ -184,375 +156,354 @@ static bool TryFactory(uintptr_t ptrAddr) {
 }
 
 static bool FindGamePointers() {
-    if (g_gameBase == 0) return false;
-
+    if (!g_gameBase) return false;
     /* Pattern 1: A1 ?? ?? ?? ?? 85 C0 74 */
-    {
-        BYTE pat[] = { 0xA1,0x00,0x00,0x00,0x00, 0x85,0xC0, 0x74 };
-        char msk[] = "x????xxx";
-        uintptr_t cur = g_gameBase;
-        size_t rem = g_gameSize;
-        for (int n = 0; n < 80 && cur < g_gameBase + g_gameSize - 8; n++) {
-            uintptr_t hit = FindPattern(cur, rem, pat, msk);
-            if (!hit) break;
-            uintptr_t candidate = *(uintptr_t*)(hit + 1);
-            if (TryFactory(candidate)) return true;
-            cur = hit + 1;
-            rem = g_gameBase + g_gameSize - cur;
-        }
+    BYTE p1[] = {0xA1,0,0,0,0,0x85,0xC0,0x74}; char m1[] = "x????xxx";
+    uintptr_t cur = g_gameBase; size_t rem = g_gameSize;
+    for (int n = 0; n < 100 && cur < g_gameBase+g_gameSize-8; n++) {
+        uintptr_t h = FindPattern(cur, rem, p1, m1);
+        if (!h) break;
+        if (TryFactory(*(uintptr_t*)(h+1))) return true;
+        cur = h+1; rem = g_gameBase+g_gameSize-cur;
     }
-
     /* Pattern 2: 8B 0D ?? ?? ?? ?? 8B 41 04 */
-    {
-        BYTE pat[] = { 0x8B,0x0D,0x00,0x00,0x00,0x00, 0x8B,0x41,0x04 };
-        char msk[] = "xx????xxx";
-        uintptr_t cur = g_gameBase;
-        size_t rem = g_gameSize;
-        for (int n = 0; n < 80 && cur < g_gameBase + g_gameSize - 10; n++) {
-            uintptr_t hit = FindPattern(cur, rem, pat, msk);
-            if (!hit) break;
-            uintptr_t candidate = *(uintptr_t*)(hit + 2);
-            if (TryFactory(candidate)) return true;
-            cur = hit + 1;
-            rem = g_gameBase + g_gameSize - cur;
-        }
+    BYTE p2[] = {0x8B,0x0D,0,0,0,0,0x8B,0x41,0x04}; char m2[] = "xx????xxx";
+    cur = g_gameBase; rem = g_gameSize;
+    for (int n = 0; n < 100 && cur < g_gameBase+g_gameSize-9; n++) {
+        uintptr_t h = FindPattern(cur, rem, p2, m2);
+        if (!h) break;
+        if (TryFactory(*(uintptr_t*)(h+2))) return true;
+        cur = h+1; rem = g_gameBase+g_gameSize-cur;
     }
-
-    /* Pattern 3: 8B 35 ?? ?? ?? ?? 85 F6 74 (mov esi,[addr]; test esi,esi; jz) */
-    {
-        BYTE pat[] = { 0x8B,0x35,0x00,0x00,0x00,0x00, 0x85,0xF6, 0x74 };
-        char msk[] = "xx????xxx";
-        uintptr_t cur = g_gameBase;
-        size_t rem = g_gameSize;
-        for (int n = 0; n < 80 && cur < g_gameBase + g_gameSize - 10; n++) {
-            uintptr_t hit = FindPattern(cur, rem, pat, msk);
-            if (!hit) break;
-            uintptr_t candidate = *(uintptr_t*)(hit + 2);
-            if (TryFactory(candidate)) return true;
-            cur = hit + 1;
-            rem = g_gameBase + g_gameSize - cur;
-        }
+    /* Pattern 3: 8B 35 ?? ?? ?? ?? 85 F6 74 */
+    BYTE p3[] = {0x8B,0x35,0,0,0,0,0x85,0xF6,0x74}; char m3[] = "xx????xxx";
+    cur = g_gameBase; rem = g_gameSize;
+    for (int n = 0; n < 100 && cur < g_gameBase+g_gameSize-9; n++) {
+        uintptr_t h = FindPattern(cur, rem, p3, m3);
+        if (!h) break;
+        if (TryFactory(*(uintptr_t*)(h+2))) return true;
+        cur = h+1; rem = g_gameBase+g_gameSize-cur;
     }
-
     return false;
 }
 
 static float GetVehicleSpeed() {
-    if (!g_offsetsFound || g_pPedFactory == 0) return -1.0f;
-
-    uintptr_t factoryPtr = 0, pedPtr = 0, vehPtr = 0;
-    if (!SafeReadPtr(g_pPedFactory, &factoryPtr) || !IsValidPtr(factoryPtr))
-        return -1.0f;
-    if (!SafeReadPtr(factoryPtr + OFF_PEDFACTORY_PLAYER, &pedPtr) ||
-        !IsValidPtr(pedPtr))
-        return -1.0f;
-    if (!SafeReadPtr(pedPtr + g_vehicleOff, &vehPtr))
-        return -1.0f;
-    if (vehPtr == 0) return -1.0f;
-    if (!IsValidPtr(vehPtr)) return -1.0f;
-
+    if (!g_offsetsFound) return -1.0f;
+    uintptr_t fp = 0, ped = 0, veh = 0;
+    if (!SafeReadPtr(g_pPedFactory, &fp) || !IsHeapPtr(fp)) return -1.0f;
+    if (!SafeReadPtr(fp + OFF_PEDFACTORY_PLAYER, &ped) || !IsHeapPtr(ped)) return -1.0f;
+    if (!SafeReadPtr(ped + g_vehicleOff, &veh)) return -1.0f;
+    if (veh == 0) return -1.0f;
+    if (!IsHeapPtr(veh)) return -1.0f;
     float vx, vy, vz;
-    uintptr_t vBase = vehPtr + g_velocityOff;
-    if (!SafeReadFloat(vBase,     &vx) ||
-        !SafeReadFloat(vBase + 4, &vy) ||
-        !SafeReadFloat(vBase + 8, &vz))
+    uintptr_t vb = veh + g_velocityOff;
+    if (!SafeReadFloat(vb, &vx) || !SafeReadFloat(vb+4, &vy) || !SafeReadFloat(vb+8, &vz))
         return -1.0f;
-
-    float speed = sqrtf(vx*vx + vy*vy + vz*vz) * KMH_MULTIPLIER;
-    if (speed >= 0.0f && speed <= 500.0f)
-        return speed;
-
-    /* Probe alternate velocity offsets */
-    for (int i = 0; i < NUM_VEL_OFFS; i++) {
-        int off = VELOCITY_OFFSETS[i];
-        if (off == g_velocityOff) continue;
-        vBase = vehPtr + off;
-        if (!SafeReadFloat(vBase,     &vx) ||
-            !SafeReadFloat(vBase + 4, &vy) ||
-            !SafeReadFloat(vBase + 8, &vz))
-            continue;
-        float s = sqrtf(vx*vx + vy*vy + vz*vz) * KMH_MULTIPLIER;
-        if (s >= 0.0f && s <= 500.0f) {
-            g_velocityOff = off;
-            return s;
-        }
-    }
+    float s = sqrtf(vx*vx+vy*vy+vz*vz) * 3.6f;
+    if (s >= 0.0f && s <= 500.0f) return s;
     return 0.0f;
 }
 
 /* --------------------------------------------------------------------------
- * Overlay Window
- *
- * A transparent, click-through, topmost window positioned over the game.
- * Redrawn at OVERLAY_FPS using GDI with alpha blending via UpdateLayeredWindow.
+ * D3DX Rendering
  * -------------------------------------------------------------------------- */
+static void LoadConfig() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_hModule, path, MAX_PATH);
+    /* Go up from plugins/ to game root, then into SpeedoIV/Config.ini */
+    char* slash = strrchr(path, '\\');
+    if (slash) *slash = 0;
+    slash = strrchr(path, '\\');
+    if (slash) *slash = 0;
 
-static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT msg,
-                                       WPARAM wParam, LPARAM lParam) {
-    return DefWindowProcA(hWnd, msg, wParam, lParam);
-}
+    char ini[MAX_PATH];
+    snprintf(ini, MAX_PATH, "%s\\SpeedoIV\\Config.ini", path);
 
-static HWND FindGameWindow() {
-    /* Find the main GTA IV window */
-    HWND h = FindWindowA("grcWindow", NULL);  /* RAGE game window class */
-    if (!h) h = FindWindowA(NULL, "GTAIV");
-    if (!h) h = FindWindowA(NULL, "GTA IV");
-    return h;
-}
+    g_cfg.autostart = GetPrivateProfileIntA("Config", "Autostart", 1, ini) != 0;
+    g_cfg.toggleKey = GetPrivateProfileIntA("Config", "ToggleKey", VK_F5, ini);
+    g_cfg.texSizeX = (float)GetPrivateProfileIntA("Config", "TexSizeX", 300, ini);
+    g_cfg.texSizeY = (float)GetPrivateProfileIntA("Config", "TexSizeY", 300, ini);
+    g_cfg.enableKMH = GetPrivateProfileIntA("Config", "EnableKMH", 1, ini) != 0;
+    g_cfg.maxSpeed = (float)GetPrivateProfileIntA("Config", "MaxSpeed", 300, ini);
+    g_cfg.sizeX = (float)GetPrivateProfileIntA("Config", "SizeX", 242, ini);
+    g_cfg.sizeY = (float)GetPrivateProfileIntA("Config", "SizeY", 234, ini);
+    g_cfg.alpha = GetPrivateProfileIntA("Config", "Alpha", 240, ini);
+    GetPrivateProfileStringA("Config", "SkinFolder", "Default", g_cfg.skinFolder, 64, ini);
+    GetPrivateProfileStringA("Config", "ScreenAlign", "BL", g_cfg.screenAlign, 4, ini);
 
-static void DrawOverlay(float speed) {
-    if (!g_hOverlay || !g_hGameWnd) return;
-
-    /* Get game window position and size */
-    RECT rc;
-    GetClientRect(g_hGameWnd, &rc);
-    POINT pt = { 0, 0 };
-    ClientToScreen(g_hGameWnd, &pt);
-    int gw = rc.right - rc.left;
-    int gh = rc.bottom - rc.top;
-
-    /* Position overlay to match game window */
-    SetWindowPos(g_hOverlay, HWND_TOPMOST,
-                 pt.x, pt.y, gw, gh,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
-    /* Create off-screen DC and bitmap for UpdateLayeredWindow */
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, gw, gh);
-    HBITMAP hOldBmp = (HBITMAP)SelectObject(hdcMem, hBmp);
-
-    /* Clear with fully transparent */
-    BLENDFUNCTION blend = {};
-    blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
-
-    /* Use GDI+ style: fill bitmap with 0 alpha everywhere */
-    /* For simplicity, use a BITMAPINFO to create a 32bpp DIB section */
-    SelectObject(hdcMem, hOldBmp);
-    DeleteObject(hBmp);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = gw;
-    bmi.bmiHeader.biHeight = -gh; /* top-down */
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* pBits = NULL;
-    hBmp = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (!hBmp || !pBits) {
-        DeleteDC(hdcMem);
-        ReleaseDC(NULL, hdcScreen);
-        return;
-    }
-    hOldBmp = (HBITMAP)SelectObject(hdcMem, hBmp);
-
-    /* Clear to transparent black */
-    memset(pBits, 0, gw * gh * 4);
-
-    /* Draw speed text with manual alpha */
+    /* Read float values as strings */
     char buf[32];
-    snprintf(buf, sizeof(buf), "%d KM/H", (int)speed);
-    int len = (int)strlen(buf);
+    GetPrivateProfileStringA("Config", "PositionX", "26.5", buf, 32, ini);
+    g_cfg.posX = (float)atof(buf);
+    GetPrivateProfileStringA("Config", "PositionY", "-3.0", buf, 32, ini);
+    g_cfg.posY = (float)atof(buf);
+    GetPrivateProfileStringA("Config", "Angle", "0.0", buf, 32, ini);
+    g_cfg.angle = (float)atof(buf);
 
-    /* Calculate text position */
-    HFONT hOldFont = (HFONT)SelectObject(hdcMem, g_hFont);
-    SIZE textSize;
-    GetTextExtentPoint32A(hdcMem, buf, len, &textSize);
-
-    int tx = gw - MARGIN_RIGHT - textSize.cx / 2;
-    int ty = gh - MARGIN_BOTTOM - textSize.cy;
-
-    /* Draw a rounded-ish background rectangle with alpha */
-    int pad = 8;
-    RECT bgRect = { tx - pad, ty - pad/2,
-                    tx + textSize.cx + pad, ty + textSize.cy + pad/2 };
-
-    /* Fill background pixels with semi-transparent color */
-    BYTE bgR = GetRValue(BG_COLOR);
-    BYTE bgG = GetGValue(BG_COLOR);
-    BYTE bgB = GetBValue(BG_COLOR);
-    uint32_t* pixels = (uint32_t*)pBits;
-    for (int y = bgRect.top; y < bgRect.bottom && y < gh; y++) {
-        if (y < 0) continue;
-        for (int x = bgRect.left; x < bgRect.right && x < gw; x++) {
-            if (x < 0) continue;
-            /* Pre-multiplied alpha for UpdateLayeredWindow */
-            BYTE a = BG_ALPHA;
-            pixels[y * gw + x] =
-                ((DWORD)a << 24) |
-                ((DWORD)((bgR * a) / 255) << 16) |
-                ((DWORD)((bgG * a) / 255) << 8) |
-                ((DWORD)((bgB * a) / 255));
-        }
-    }
-
-    /* Draw text with shadow using GDI (alpha = 255 for text pixels) */
-    SetBkMode(hdcMem, TRANSPARENT);
-
-    /* Shadow */
-    SetTextColor(hdcMem, SHADOW_COLOR);
-    TextOutA(hdcMem, tx + 1, ty + 1, buf, len);
-    /* Main text */
-    SetTextColor(hdcMem, TEXT_COLOR);
-    TextOutA(hdcMem, tx, ty, buf, len);
-
-    SelectObject(hdcMem, hOldFont);
-
-    /* Fix alpha channel for text pixels (GDI sets alpha to 0) */
-    /* Set alpha=255 for any pixel that GDI wrote (non-zero RGB where bg was 0
-       or different from bg) */
-    for (int y = (ty - 2 > 0 ? ty - 2 : 0);
-         y < ty + textSize.cy + 4 && y < gh; y++) {
-        for (int x = (tx - 2 > 0 ? tx - 2 : 0);
-             x < tx + textSize.cx + 4 && x < gw; x++) {
-            uint32_t px = pixels[y * gw + x];
-            BYTE r = (px >> 16) & 0xFF;
-            BYTE g = (px >> 8) & 0xFF;
-            BYTE b = px & 0xFF;
-            BYTE a = (px >> 24) & 0xFF;
-            /* If pixel has color but no alpha, it was drawn by GDI text */
-            if ((r || g || b) && a == 0) {
-                /* Set to fully opaque, pre-multiplied */
-                pixels[y * gw + x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-
-    /* Update the layered window */
-    POINT srcPt = { 0, 0 };
-    SIZE wndSize = { gw, gh };
-    POINT dstPt = { pt.x, pt.y };
-
-    UpdateLayeredWindow(g_hOverlay, hdcScreen,
-                        &dstPt, &wndSize,
-                        hdcMem, &srcPt,
-                        0, &blend, ULW_ALPHA);
-
-    /* Cleanup */
-    SelectObject(hdcMem, hOldBmp);
-    DeleteObject(hBmp);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
+    g_showSpeedo = g_cfg.autostart;
 }
 
-static void HideOverlay() {
-    if (g_hOverlay) ShowWindow(g_hOverlay, SW_HIDE);
+static bool InitD3DResources(IDirect3DDevice9* pDev) {
+    if (g_d3dReady) return true;
+    g_pDevice = pDev;
+
+    /* Build texture paths */
+    char basePath[MAX_PATH];
+    GetModuleFileNameA(g_hModule, basePath, MAX_PATH);
+    char* sl = strrchr(basePath, '\\'); if (sl) *sl = 0;
+    sl = strrchr(basePath, '\\'); if (sl) *sl = 0;
+
+    char bckPath[MAX_PATH], pinPath[MAX_PATH];
+    snprintf(bckPath, MAX_PATH, "%s\\SpeedoIV\\%s\\Bck.png", basePath, g_cfg.skinFolder);
+    snprintf(pinPath, MAX_PATH, "%s\\SpeedoIV\\%s\\Pin.png", basePath, g_cfg.skinFolder);
+
+    /* Create sprite */
+    if (FAILED(D3DXCreateSprite(pDev, &g_pSprite)))
+        return false;
+
+    /* Load textures */
+    if (FAILED(D3DXCreateTextureFromFileExA(
+            pDev, bckPath,
+            (UINT)g_cfg.texSizeX, (UINT)g_cfg.texSizeY,
+            1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+            D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR,
+            0, NULL, NULL, &g_pTexBck)))
+        return false;
+
+    if (FAILED(D3DXCreateTextureFromFileExA(
+            pDev, pinPath,
+            (UINT)g_cfg.texSizeX, (UINT)g_cfg.texSizeY,
+            1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+            D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR,
+            0, NULL, NULL, &g_pTexPin)))
+        return false;
+
+    /* Create font for speed text */
+    D3DXCreateFontA(pDev, 24, 0, FW_BOLD, 1, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                    ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                    "Arial", &g_pFont);
+
+    g_d3dReady = true;
+    return true;
+}
+
+static void ReleaseD3DResources() {
+    if (g_pSprite) { g_pSprite->Release(); g_pSprite = NULL; }
+    if (g_pTexBck) { g_pTexBck->Release(); g_pTexBck = NULL; }
+    if (g_pTexPin) { g_pTexPin->Release(); g_pTexPin = NULL; }
+    if (g_pFont)   { g_pFont->Release();   g_pFont = NULL; }
+    g_d3dReady = false;
+}
+
+static void RenderSpeedometer(IDirect3DDevice9* pDev, float speed) {
+    if (!InitD3DResources(pDev)) return;
+
+    /* Get screen size */
+    D3DVIEWPORT9 vp;
+    pDev->GetViewport(&vp);
+    float scrW = (float)vp.Width;
+    float scrH = (float)vp.Height;
+
+    /* Calculate position based on screen alignment */
+    float drawX, drawY;
+    if (g_cfg.screenAlign[0] == 'B' || g_cfg.screenAlign[0] == 'b')
+        drawY = scrH - g_cfg.sizeY + g_cfg.posY;
+    else
+        drawY = g_cfg.posY;
+
+    if (g_cfg.screenAlign[1] == 'R' || g_cfg.screenAlign[1] == 'r')
+        drawX = scrW - g_cfg.sizeX + g_cfg.posX;
+    else
+        drawX = g_cfg.posX;
+
+    /* Needle rotation: map speed to angle
+     * Original SpeedoIV: 0 speed = -135 degrees, max speed = +135 degrees
+     * Total sweep = 270 degrees */
+    float speedRatio = speed / g_cfg.maxSpeed;
+    if (speedRatio > 1.0f) speedRatio = 1.0f;
+    float needleAngle = (-135.0f + speedRatio * 270.0f) * (float)M_PI / 180.0f;
+
+    /* Center of the speedometer dial */
+    float cx = g_cfg.sizeX / 2.0f;
+    float cy = g_cfg.sizeY / 2.0f;
+
+    D3DXVECTOR2 center(cx, cy);
+    D3DXVECTOR2 pos(drawX, drawY);
+    D3DXVECTOR2 scale(g_cfg.sizeX / g_cfg.texSizeX,
+                      g_cfg.sizeY / g_cfg.texSizeY);
+
+    DWORD color = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
+
+    g_pSprite->Begin(D3DXSPRITE_ALPHABLEND);
+
+    /* Draw background (no rotation) */
+    D3DXMATRIX matBck;
+    D3DXMatrixTransformation2D(&matBck, &center, 0.0f, &scale,
+                                &center, g_cfg.angle * (float)M_PI / 180.0f,
+                                &pos);
+    g_pSprite->SetTransform(&matBck);
+    g_pSprite->Draw(g_pTexBck, NULL, NULL, NULL, color);
+
+    /* Draw needle (rotated) */
+    D3DXMATRIX matPin;
+    D3DXMatrixTransformation2D(&matPin, &center, 0.0f, &scale,
+                                &center, needleAngle + g_cfg.angle * (float)M_PI / 180.0f,
+                                &pos);
+    g_pSprite->SetTransform(&matPin);
+    g_pSprite->Draw(g_pTexPin, NULL, NULL, NULL, color);
+
+    g_pSprite->End();
+
+    /* Draw digital speed text */
+    if (g_pFont) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", (int)speed);
+        RECT rc;
+        rc.left   = (LONG)(drawX + cx - 40);
+        rc.top    = (LONG)(drawY + cy + 30);
+        rc.right  = (LONG)(drawX + cx + 40);
+        rc.bottom = (LONG)(drawY + cy + 60);
+        g_pFont->DrawTextA(NULL, buf, -1, &rc, DT_CENTER | DT_NOCLIP,
+                           D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255));
+    }
 }
 
 /* --------------------------------------------------------------------------
- * Main overlay thread
+ * EndScene Hook via inline patch
+ *
+ * We find the game's call to IDirect3DDevice9::EndScene and place a JMP
+ * detour before it. In the detour we get the device from ECX and render.
+ *
+ * Alternative: We hook the game's per-frame render function.
+ * Since DXVK shares the vtable for ALL devices created through its d3d9.dll,
+ * we CAN hook the vtable -- but we need to get it from the game's device,
+ * not from a separate dummy device.
+ *
+ * Simplest working approach: scan for the game's stored device pointer,
+ * then hook EndScene through its vtable directly.
  * -------------------------------------------------------------------------- */
-static DWORD WINAPI OverlayThread(LPVOID) {
-    /* Wait for game to initialize */
-    Sleep(8000);
 
-    /* Resolve game module */
+typedef HRESULT (WINAPI *EndScene_t)(IDirect3DDevice9*);
+static EndScene_t g_origEndScene = NULL;
+
+static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* pDev) {
+    if (!g_initialized) {
+        HMODULE hGame = GetModuleHandleA("GTAIV.exe");
+        if (hGame) {
+            g_gameBase = (uintptr_t)hGame;
+            IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hGame;
+            IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_gameBase + dos->e_lfanew);
+            g_gameSize = nt->OptionalHeader.SizeOfImage;
+            FindGamePointers();
+        }
+        LoadConfig();
+        g_initialized = true;
+    }
+
+    /* Toggle with configured key */
+    static bool keyPrev = false;
+    bool keyNow = (GetAsyncKeyState(g_cfg.toggleKey) & 0x8000) != 0;
+    if (keyNow && !keyPrev) g_showSpeedo = !g_showSpeedo;
+    keyPrev = keyNow;
+
+    if (g_showSpeedo && g_offsetsFound) {
+        float speed = GetVehicleSpeed();
+        if (speed >= 0.0f) {
+            RenderSpeedometer(pDev, speed);
+        }
+    }
+
+    return g_origEndScene(pDev);
+}
+
+/* --------------------------------------------------------------------------
+ * Hook Setup: Get game's device and hook its vtable
+ *
+ * DXVK uses a single vtable shared by all device instances created through
+ * its d3d9.dll. So we wait for the game to create its device, then find it
+ * by scanning the game's global pointers, and hook EndScene on that vtable.
+ * -------------------------------------------------------------------------- */
+static bool HookGameDevice() {
+    /* Strategy: scan for global pointers that hold a valid IDirect3DDevice9*
+     * A valid device pointer will have a vtable where entry[42] (EndScene)
+     * points into the d3d9.dll module (DXVK's code). */
+
+    HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
+    if (!hD3D9) return false;
+    IMAGE_DOS_HEADER* d3dDos = (IMAGE_DOS_HEADER*)hD3D9;
+    IMAGE_NT_HEADERS* d3dNt = (IMAGE_NT_HEADERS*)((uintptr_t)hD3D9 + d3dDos->e_lfanew);
+    uintptr_t d3dBase = (uintptr_t)hD3D9;
+    uintptr_t d3dEnd = d3dBase + d3dNt->OptionalHeader.SizeOfImage;
+
+    /* Scan the game's .data/.bss sections for a pointer that looks like a device */
+    /* The game image has globals from gameBase to gameBase+gameSize */
+    uintptr_t scanStart = g_gameBase;
+    uintptr_t scanEnd = g_gameBase + g_gameSize;
+
+    for (uintptr_t addr = scanStart; addr < scanEnd - 4; addr += 4) {
+        if (!IsReadable((void*)addr, 4)) continue;
+        uintptr_t candidate = *(uintptr_t*)addr;
+        if (!IsHeapPtr(candidate)) continue;
+        if (!IsReadable((void*)candidate, 4)) continue;
+
+        /* Check vtable pointer */
+        uintptr_t vtablePtr = *(uintptr_t*)candidate;
+        if (vtablePtr < d3dBase || vtablePtr >= d3dEnd) continue;
+
+        /* vtable should be readable and entry[42] should point into d3d9.dll */
+        if (!IsReadable((void*)(vtablePtr + 42*4), 4)) continue;
+        uintptr_t endSceneAddr = *(uintptr_t*)(vtablePtr + 42*4);
+        if (endSceneAddr < d3dBase || endSceneAddr >= d3dEnd) continue;
+
+        /* This looks like a real IDirect3DDevice9*! Hook its EndScene. */
+        void** vt = (void**)vtablePtr;
+        DWORD oldProt;
+        if (VirtualProtect(&vt[42], 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            g_origEndScene = (EndScene_t)vt[42];
+            vt[42] = (void*)HookedEndScene;
+            VirtualProtect(&vt[42], 4, oldProt, &oldProt);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* --------------------------------------------------------------------------
+ * Init thread
+ * -------------------------------------------------------------------------- */
+static DWORD WINAPI InitThread(LPVOID) {
+    /* Wait for game to initialize its D3D device */
+    Sleep(10000);
+
     HMODULE hGame = GetModuleHandleA("GTAIV.exe");
     if (hGame) {
         g_gameBase = (uintptr_t)hGame;
         IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hGame;
-        IMAGE_NT_HEADERS* nt =
-            (IMAGE_NT_HEADERS*)(g_gameBase + dos->e_lfanew);
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_gameBase + dos->e_lfanew);
         g_gameSize = nt->OptionalHeader.SizeOfImage;
     }
 
-    /* Find game pointers - retry until game is fully loaded */
-    for (int attempt = 0; attempt < 30 && !g_offsetsFound; attempt++) {
-        FindGamePointers();
-        if (!g_offsetsFound) Sleep(2000);
+    /* Try to hook -- retry if game device isn't ready yet */
+    for (int i = 0; i < 20; i++) {
+        if (HookGameDevice()) break;
+        Sleep(2000);
     }
-
-    /* Find game window */
-    for (int attempt = 0; attempt < 30 && !g_hGameWnd; attempt++) {
-        g_hGameWnd = FindGameWindow();
-        if (!g_hGameWnd) Sleep(1000);
-    }
-    if (!g_hGameWnd) return 0;
-
-    /* Create overlay window */
-    WNDCLASSEXA wc = {};
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = OverlayWndProc;
-    wc.hInstance      = g_hModule;
-    wc.lpszClassName  = "SpeedoIVCE_Overlay";
-    RegisterClassExA(&wc);
-
-    g_hOverlay = CreateWindowExA(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        wc.lpszClassName, "SpeedoIV-CE",
-        WS_POPUP,
-        0, 0, 1, 1,
-        NULL, NULL, g_hModule, NULL);
-
-    if (!g_hOverlay) return 0;
-
-    /* Create font */
-    g_hFont = CreateFontA(
-        FONT_SIZE, 0, 0, 0, FW_BOLD,
-        FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        FONT_NAME);
-
-    /* Main loop */
-    DWORD frameTime = 1000 / OVERLAY_FPS;
-    while (g_running) {
-        /* Check game window still exists */
-        if (!IsWindow(g_hGameWnd)) {
-            g_hGameWnd = FindGameWindow();
-            if (!g_hGameWnd) { Sleep(1000); continue; }
-        }
-
-        /* Toggle with F5 */
-        static bool f5Prev = false;
-        bool f5Now = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-        if (f5Now && !f5Prev) g_showSpeedo = !g_showSpeedo;
-        f5Prev = f5Now;
-
-        /* Check if game window is foreground (don't show over other apps) */
-        HWND fg = GetForegroundWindow();
-        bool gameActive = (fg == g_hGameWnd);
-
-        if (g_showSpeedo && g_offsetsFound && gameActive) {
-            float speed = GetVehicleSpeed();
-            if (speed >= 0.0f) {
-                DrawOverlay(speed);
-            } else {
-                HideOverlay();
-            }
-        } else {
-            HideOverlay();
-        }
-
-        Sleep(frameTime);
-    }
-
-    /* Cleanup */
-    if (g_hOverlay) DestroyWindow(g_hOverlay);
-    UnregisterClassA("SpeedoIVCE_Overlay", g_hModule);
-    if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
 
     return 0;
 }
 
 /* --------------------------------------------------------------------------
- * DLL Entry Point
+ * DLL Entry
  * -------------------------------------------------------------------------- */
 extern "C" BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
-        CreateThread(NULL, 0, OverlayThread, NULL, 0, NULL);
+        CreateThread(NULL, 0, InitThread, NULL, 0, NULL);
     } else if (reason == DLL_PROCESS_DETACH) {
         g_running = false;
-        Sleep(100);
-        if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
+        ReleaseD3DResources();
     }
     return TRUE;
 }
