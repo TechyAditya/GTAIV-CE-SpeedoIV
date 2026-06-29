@@ -243,9 +243,13 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     Sleep(10000); /* Wait for game + DXVK init */
 
+    auto mod = sdk::GetGameModule();
+    if (!mod.valid) { sdk::Log("FATAL: game module not found"); return 0; }
+    sdk::Log("Game module: base=0x%08X size=0x%08X", (unsigned)mod.base, (unsigned)mod.size);
+
     for (int i = 0; i < 10; i++) {
         sdk::Log("Hook attempt %d...", i + 1);
-        if (d3d9hook::Install(g_hModule)) break;
+        if (d3d9hook::Install(mod.base, mod.size)) break;
         Sleep(3000);
     }
 
