@@ -244,37 +244,78 @@ static void Render(IDirect3DDevice9* dev, float speed) {
     else
         drawX = g_cfg.posX;
 
-    /* Pin already points at the "0" position in the texture.
-     * Rotate it clockwise from 0 (speed=0) to +270deg (speed=maxSpeed). */
+    /* Pin already points at the "0" position in the texture (bottom-left of dial).
+     * Rotate it clockwise from 0deg (speed=0) to +270deg (speed=maxSpeed). */
     float ratio = speed / g_cfg.maxSpeed;
+    if (ratio < 0.f) ratio = 0.f;
     if (ratio > 1.f) ratio = 1.f;
-    float needle = ratio * 270.f * (float)M_PI / 180.f;
+    float needleRad = ratio * 270.f * (float)M_PI / 180.f;
+    float userRad = g_cfg.angle * (float)M_PI / 180.f;
 
-    /* Use texture-pixel center for scaling and rotation pivots so that
-     * a (texSize/2, texSize/2) point in the texture is at the screen position
-     * (drawX + sizeX/2, drawY + sizeY/2) after scaling. */
-    D3DXVECTOR2 scalingCenter(0.f, 0.f);
-    D3DXVECTOR2 rotCenter(g_cfg.texSizeX / 2.f, g_cfg.texSizeY / 2.f);
-    D3DXVECTOR2 pos(drawX, drawY);
-    D3DXVECTOR2 scale(g_cfg.sizeX / g_cfg.texSizeX, g_cfg.sizeY / g_cfg.texSizeY);
-    DWORD color = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
+    /* D3DXMatrixTransformation2D applies (in order):
+     *   1. translate by -scalingCenter
+     *   2. scale
+     *   3. translate by +scalingCenter
+     *   4. translate by -rotationCenter
+     *   5. rotate
+     *   6. translate by +rotationCenter
+     *   7. translate by +translation
+     *
+     * For a sprite the destination is the texture's (0,0) corner placed at
+     * `translation` if both centers are (0,0). To rotate the sprite around
+     * its visual centre and place that centre at (drawX + sizeX/2,
+     * drawY + sizeY/2), we use ONE shared centre = (texSize/2, texSize/2)
+     * for scaling AND rotation, and set translation so that after the
+     * full transform the texture centre lands where we want it.
+     *
+     * With shared centre C = (texSize/2, texSize/2):
+     *   - scaling step maps texel C to itself (C is the scaling pivot, but
+     *     because the matrix uses C for BOTH pivots and scale happens before
+     *     rotation, after scaling the visual centre of the sprite is at C
+     *     in unscaled texel space).
+     *   - rotation step rotates around C -> C stays at C.
+     *   - final translation adds (drawX + sizeX/2 - C.x, drawY + sizeY/2 - C.y)
+     *     so that C ends up at (drawX + sizeX/2, drawY + sizeY/2).
+     *
+     * Actually simpler: keep translation = (drawX, drawY) and use a single
+     * pivot at scaled centre. Scale must apply first so the rotation pivot
+     * is in *scaled* coords. D3DX scales around scalingCenter (which is in
+     * texel coords), then rotates around rotationCenter (also texel coords)
+     * after scaling -- meaning rotationCenter is interpreted post-scale.
+     *
+     * Verified by D3DX docs: rotationCenter is in pre-scale texel space
+     * BUT the rotation is applied to already-scaled geometry, so we should
+     * pass rotationCenter in scaled units. We'll bypass the issue by using
+     * scalingCenter = rotationCenter = (0,0) and pre-computing translation
+     * so the sprite's scaled centre is at the requested screen point. */
 
-    /* Use ALPHABLEND but no SORT_TEXTURE which may interfere with DXVK */
+    float scaleX = g_cfg.sizeX / g_cfg.texSizeX;
+    float scaleY = g_cfg.sizeY / g_cfg.texSizeY;
+    float cx = drawX + g_cfg.sizeX * 0.5f;   /* desired centre on screen */
+    float cy = drawY + g_cfg.sizeY * 0.5f;
+
+    D3DXVECTOR2 zero(0.f, 0.f);
+    D3DXVECTOR2 scale(scaleX, scaleY);
+    /* Rotation pivot in scaled space = scaled texture centre */
+    D3DXVECTOR2 rotCenter(g_cfg.texSizeX * 0.5f * scaleX,
+                          g_cfg.texSizeY * 0.5f * scaleY);
+    /* Translation places scaled (0,0) corner so that scaled centre lands at (cx,cy) */
+    D3DXVECTOR2 pos(cx - rotCenter.x, cy - rotCenter.y);
+
+    DWORD bgColor  = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
+    DWORD pinColor = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
+
     g_sprite->Begin(D3DXSPRITE_ALPHABLEND);
 
-    /* Background - explicit white color, full alpha to test rendering */
-    DWORD bgColor = D3DCOLOR_ARGB(255, 255, 255, 255);
-    DWORD pinColor = D3DCOLOR_ARGB(255, 255, 255, 255);
-
     D3DXMATRIX mat;
-    D3DXMatrixTransformation2D(&mat, &scalingCenter, 0.f, &scale, &rotCenter,
-                                g_cfg.angle * (float)M_PI / 180.f, &pos);
+    /* Background: only user-configured rotation (usually 0) */
+    D3DXMatrixTransformation2D(&mat, &zero, 0.f, &scale, &rotCenter, userRad, &pos);
     g_sprite->SetTransform(&mat);
     g_sprite->Draw(g_texBck, NULL, NULL, NULL, bgColor);
 
-    /* Needle */
-    D3DXMatrixTransformation2D(&mat, &scalingCenter, 0.f, &scale, &rotCenter,
-                                needle + g_cfg.angle * (float)M_PI / 180.f, &pos);
+    /* Needle: speed-driven rotation, same pivot/scale/translation */
+    D3DXMatrixTransformation2D(&mat, &zero, 0.f, &scale, &rotCenter,
+                               needleRad + userRad, &pos);
     g_sprite->SetTransform(&mat);
     g_sprite->Draw(g_texPin, NULL, NULL, NULL, pinColor);
 
@@ -293,45 +334,16 @@ static void OnFrame(IDirect3DDevice9* dev) {
         if (mod.valid) sdk::player::Init(mod.base, mod.size);
         LoadConfig();
         g_gameInit = true;
-        sdk::Log("Game init: offsets %s (factory=0x%08X vehOff=0x%X velOff=0x%X)",
+        sdk::Log("Game init: %s (FindPlayerPed=0x%08X FindPlayerVehicle=0x%08X)",
                  sdk::player::g_ready ? "OK" : "FAILED",
-                 (unsigned)sdk::player::g_pedFactory,
-                 sdk::player::g_vehOffset, sdk::player::g_velOffset);
+                 (unsigned)(uintptr_t)sdk::player::g_findPlayerPed,
+                 (unsigned)(uintptr_t)sdk::player::g_findPlayerVehicle);
     }
 
     /* Live-reload Config.ini every ~1 second so you can tune without restarting */
     static int reloadFrame = 0;
     if (++reloadFrame % 60 == 0) {
         LoadConfig();
-    }
-
-    /* Re-scan if we're locked on a wrong factory (always reads near-zero in vehicle).
-     * If speed stays under 1 km/h for > 600 frames (~10s), re-scan. */
-    static int rescanFrame = 0;
-    static int lowSpeedFrames = 0;
-    static int highSpeedFrames = 0;
-    if (sdk::player::g_ready) {
-        float s = sdk::player::GetSpeed();
-        if (s < 0.0f) {
-            lowSpeedFrames = 0; highSpeedFrames = 0;
-        } else if (s < 1.0f) {
-            lowSpeedFrames++;
-            if (lowSpeedFrames > 600 && highSpeedFrames < 5) {
-                /* Stuck at near-zero with no real movement detected -- wrong factory */
-                if (++rescanFrame % 120 == 0) {
-                    sdk::player::g_ready = false;
-                    auto mod = sdk::GetGameModule();
-                    if (mod.valid) sdk::player::Init(mod.base, mod.size);
-                    sdk::Log("Re-scan (stuck low): factory=0x%08X vehOff=0x%X velOff=0x%X",
-                             (unsigned)sdk::player::g_pedFactory,
-                             sdk::player::g_vehOffset, sdk::player::g_velOffset);
-                    lowSpeedFrames = 0;
-                }
-            }
-        } else {
-            highSpeedFrames++;
-            lowSpeedFrames = 0;
-        }
     }
 
     /* Toggle key */
@@ -347,13 +359,16 @@ static void OnFrame(IDirect3DDevice9* dev) {
     static int frame = 0;
     if (++frame % 300 == 1) {
         float spd = sdk::player::g_ready ? sdk::player::GetSpeed() : -99.0f;
-        sdk::Log("Frame %d: visible=%d speed=%.1f resOk=%d", frame, g_visible, spd, g_resOk);
+        sdk::Log("Frame %d: visible=%d speed=%.1f velOff=0x%X resOk=%d",
+                 frame, g_visible, spd, sdk::player::g_velOffset, g_resOk);
     }
 
-    /* Render if visible and in vehicle */
+    /* Render whenever visible. Show 0 km/h when on foot so the dial stays
+     * usable as a reference and recovers cleanly from alt+tab. */
     if (g_visible && sdk::player::g_ready) {
         float speed = sdk::player::GetSpeed();
-        if (speed >= 0.f) Render(dev, speed);
+        if (speed < 0.f) speed = 0.f;
+        Render(dev, speed);
     }
 }
 

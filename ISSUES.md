@@ -270,3 +270,94 @@ launch. One command, full iteration.
 
 **Live-tunable params**: For visual tweaks (position, size, alpha,
 colors), `Config.ini` is re-read every ~1 second. No restart needed.
+
+---
+
+## 16. Position math: rotation pivot in scaled vs unscaled space
+
+**Finding**: After verifying that `D3DXMatrixTransformation2D` applies
+`T(-Sc)*S*T(Sc)*T(-Rc)*R*T(Rc)*T(Mt)`, our previous code used
+`rotCenter = (texW/2, texH/2)` (unscaled texel coords) but the actual
+sprite was being scaled before rotation, so the rotation pivot was at
+the wrong screen position. The pin appeared rotated ~120 degrees around a point
+offset from the dial centre.
+
+**Fix**: Build the matrix with
+`scalingCenter = (0,0)`, `rotationCenter = (texW/2 * scaleX, texH/2 * scaleY)`
+(in post-scale units), and translation
+`pos = (cx - rotCenter.x, cy - rotCenter.y)` so the scaled visual
+centre lands exactly at `(cx, cy)`.
+
+Verified: dial + pin both centre correctly at the configured screen point.
+
+---
+
+## 17. CPedFactory pattern-scan was fundamentally unreliable
+
+**Finding**: Scoring CPedFactory candidates by `best reported speed`
+only ever locked onto the right factory if the player was already in
+motion at scan time. Even then, a stale candidate at `0x02499B24`
+(`vehOff 0x330 velOff 0x80`) consistently beat the real one at
+`0x01D3A46C`. Stuck-low rescan never recovered. Hard-coding the CE
+factory address didn't help either: the ped/vehicle offsets were also
+wrong guesses.
+
+**Fix**: Replaced the entire factory-globals approach with FusionFix's
+proven method: **pattern-scan for the game's own `FindPlayerPed` and
+`FindPlayerVehicle` helper functions** inside GTAIV.exe, then call
+them as a normal `__cdecl` function with `id=0`. These functions
+internally walk `g_PlayerInfoSlot -> g_PlayerInfoArray[slot] ->
+playerInfo->m_pPed -> ped->m_pVehicle` and return the same pointer
+that `GET_CAR_CHAR_IS_USING` native uses.
+
+CE 1.2.0.43 patterns (verified against FusionFix source/comvars.ixx
+and our own probe):
+- `FindPlayerPed`     `8B 44 24 04 85 C0 75 18 A1`
+- `FindPlayerVehicle` `8B 44 24 04 85 C0 75 15 A1 ? ? ? ? 83 F8 FF 75 04 33 C0 EB 07`
+
+Resolved addresses on our build:
+- `FindPlayerPed     @ 0x014B1C10`
+- `FindPlayerVehicle @ 0x014B1C40`
+- Shared global `g_currentPlayerSlot @ 0x01C16F14`
+- `g_PlayerInfoArray @ 0x01D88808`
+
+---
+
+## 18. Real CVehicle and CPed offsets (CE 1.2.0.43)
+
+**Finding**: Disassembly of `FindPlayerVehicle` revealed the actual
+ped-to-vehicle indirection and the in-vehicle flag, contradicting
+guesses based on legacy mods:
+
+`\\\
++0x0B30   CPed -> CVehicle* (m_pMyVehicle)
++0x026C   CPed inVehicle flag byte (bit 2 = `in vehicle`)
++0x0598   CPlayerInfo -> CPed* (m_pPlayerPed)
+\\\
+
+Live probe of the resulting CVehicle struct while driving ~38 km/h
+showed the velocity vector at **CVehicle + 0xF8** (NOT 0x70/0x80
+that legacy 1.0.x mods use):
+
+`\\\
++0x0F8 (10.588, 0.000, 0.000) |km/h|=38.12
+\\\
+
+**Fix**: Set `sdk::player::g_velOffset = 0xF8` as the primary CE
+constant. Auto-detect fallback tries `{0xF8, 0x80, 0x70, ...}` if
+the default produces zero readings on an unusual build.
+
+---
+
+## 19. alt+tab left speedometer stuck invisible
+
+**Finding**: After alt+tab the device-reset hook releases all D3D
+resources and sets `g_resOk = false`. `InitResources` is called
+again from `Render()` -- but `Render` was gated on
+`GetSpeed() >= 0`, which returns `-1` when the player is on foot
+or not driving. Result: resources never re-initialised, dial stayed
+black until you drove again, and toggling F6 didn't help.
+
+**Fix**: Always call `Render()` when `g_visible` is set. Clamp
+`speed = 0` when `GetSpeed()` returns negative so the dial shows
+a sensible idle reading. Resource re-init runs every frame as needed.

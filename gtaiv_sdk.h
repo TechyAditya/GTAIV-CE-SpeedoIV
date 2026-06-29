@@ -138,233 +138,113 @@ inline ModuleInfo GetGameModule() {
 /* ==========================================================================
  * Player & Vehicle
  *
- * Resolves CPedFactory -> PlayerPed -> Vehicle -> Velocity at runtime
- * via pattern scanning. Call Init() once, then use GetSpeed().
+ * Uses the FusionFix-style approach: pattern-scan for the game's own
+ * FindPlayerPed/FindPlayerVehicle helper functions in GTAIV.exe and CALL
+ * them directly. This is the same code-path GET_PLAYER_CHAR /
+ * GET_CAR_CHAR_IS_USING natives use internally.
+ *
+ * Patterns confirmed for CE 1.2.0.43 (verified in FusionFix source
+ * source/comvars.ixx:2798-2802). Far more reliable than guessing globals.
  * ========================================================================== */
 
 namespace player {
 
-    inline uintptr_t g_pedFactory = 0;
-    inline int       g_vehOffset  = 0;
-    inline int       g_velOffset  = 0;
-    inline bool      g_ready      = false;
+    typedef void* (__cdecl *FindFn)(int32_t id);
 
-    static const int PED_FACTORY_PLAYER_OFF = 0x4;
-    static const int VEH_OFFSETS[]  = { 0x32C, 0x330, 0x328, 0x33C, 0x320 };
-    static const int VEL_OFFSETS[]  = { 0x70,  0x80,  0x90,  0x60 };
-    static const int NUM_VEH = sizeof(VEH_OFFSETS) / sizeof(int);
-    static const int NUM_VEL = sizeof(VEL_OFFSETS) / sizeof(int);
+    inline FindFn   g_findPlayerPed     = nullptr;
+    inline FindFn   g_findPlayerVehicle = nullptr;
+    inline int      g_velOffset         = 0xF8;  /* CVehicle::m_vecMoveSpeed on CE 1.2.0.43
+                                                  * (verified by probe_vehicle.exe live dump) */
+    inline bool     g_ready             = false;
+    inline uintptr_t g_gameBase = 0;
+    inline size_t    g_gameSize = 0;
 
-    /* Validate a candidate CPedFactory global address.
-     * Returns the best speed reading found (or -1 if invalid).
-     * Side-effect: sets g_pedFactory/g_vehOffset/g_velOffset to BEST result. */
-    inline float TryFactoryStrictScored(uintptr_t ptrAddr, uintptr_t gameBase, size_t gameSize) {
-        if (!IsValidPtr(ptrAddr)) return -1;
-        uintptr_t fp = 0;
-        if (!ReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return -1;
-        uintptr_t vt = 0;
-        if (!ReadPtr(fp, &vt) || !IsValidPtr(vt)) return -1;
-        uintptr_t ped = 0;
-        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return -1;
-        uintptr_t pedVt = 0;
-        if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return -1;
-        if (pedVt < gameBase || pedVt >= gameBase + gameSize) return -1;
+    /* Probe a few candidate velocity offsets and pick the one whose
+     * vector magnitude looks like a believable speed (-> [0, 500] km/h).
+     * Tries 0xF8 first (CE verified) then a few alternates. */
+    static const int VEL_CANDIDATES[] = { 0xF8, 0x80, 0x70, 0x90, 0xA0, 0xB0, 0xC0, 0x60, 0x100 };
+    static const int NUM_VEL_CANDS = sizeof(VEL_CANDIDATES) / sizeof(int);
 
-        float bestSpeed = -1;
-        int bestVehOff = 0, bestVelOff = 0;
-        for (int v = 0; v < NUM_VEH; v++) {
-            uintptr_t veh = 0;
-            if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
-            if (veh == 0 || !IsHeapPtr(veh)) continue;
-            uintptr_t vehVt = 0;
-            if (!ReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
-            if (vehVt < gameBase || vehVt >= gameBase + gameSize) continue;
-
-            for (int vi = 0; vi < NUM_VEL; vi++) {
-                float vx, vy, vz;
-                uintptr_t vb = veh + VEL_OFFSETS[vi];
-                if (ReadFloat(vb, &vx) && ReadFloat(vb+4, &vy) && ReadFloat(vb+8, &vz)) {
-                    float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
-                    if (s > 0.1f && s <= 500.0f && s > bestSpeed) {
-                        bestSpeed = s;
-                        bestVehOff = VEH_OFFSETS[v];
-                        bestVelOff = VEL_OFFSETS[vi];
-                    }
-                }
-            }
-        }
-        if (bestSpeed > 0) {
-            g_pedFactory = ptrAddr;
-            g_vehOffset = bestVehOff;
-            g_velOffset = bestVelOff;
-            g_ready = true;
-        }
-        return bestSpeed;
+    inline float ReadSpeedAt(uintptr_t veh, int off) {
+        float vx = 0, vy = 0, vz = 0;
+        if (!ReadFloat(veh + off,   &vx)) return -1.f;
+        if (!ReadFloat(veh + off+4, &vy)) return -1.f;
+        if (!ReadFloat(veh + off+8, &vz)) return -1.f;
+        if (vx != vx || vy != vy || vz != vz) return -1.f; /* NaN */
+        return sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
     }
 
-    /* Validate a candidate CPedFactory global address.
-     * We REQUIRE the vehicle's vtable to be inside GTAIV.exe (real RAGE vehicle)
-     * AND a non-zero velocity reading to filter out stale/dummy peds. */
-    inline bool TryFactoryStrict(uintptr_t ptrAddr, uintptr_t gameBase, size_t gameSize) {
-        return TryFactoryStrictScored(ptrAddr, gameBase, gameSize) > 0;
-    }
-
-    /* Validate a candidate CPedFactory global address.
-     * Accepts any candidate where ped is in heap AND has vehicle. */
-    inline bool TryFactory(uintptr_t ptrAddr) {
-        if (!IsValidPtr(ptrAddr)) return false;
-        uintptr_t fp = 0;
-        if (!ReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return false;
-        uintptr_t vt = 0;
-        if (!ReadPtr(fp, &vt) || !IsValidPtr(vt)) return false;
-        uintptr_t ped = 0;
-        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return false;
-        uintptr_t pedVt = 0;
-        if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
-
-        for (int v = 0; v < NUM_VEH; v++) {
-            uintptr_t veh = 0;
-            if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
-            if (veh == 0) continue;
-            if (!IsHeapPtr(veh)) continue;
-            uintptr_t vehVt = 0;
-            if (!ReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
-
-            for (int vi = 0; vi < NUM_VEL; vi++) {
-                float vx, vy, vz;
-                uintptr_t vb = veh + VEL_OFFSETS[vi];
-                if (ReadFloat(vb, &vx) && ReadFloat(vb+4, &vy) && ReadFloat(vb+8, &vz)) {
-                    float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
-                    if (s >= 0.0f && s <= 500.0f && (vx != 0.0f || vy != 0.0f || vz != 0.0f)) {
-                        g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
-                        g_velOffset = VEL_OFFSETS[vi]; g_ready = true;
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    /* Same but also accepts on-foot state if no in-vehicle match is found.
-     * Use as a fallback after the strict TryFactory fails. */
-    inline bool TryFactoryFallback(uintptr_t ptrAddr) {
-        if (!IsValidPtr(ptrAddr)) return false;
-        uintptr_t fp = 0;
-        if (!ReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return false;
-        uintptr_t vt = 0;
-        if (!ReadPtr(fp, &vt) || !IsValidPtr(vt)) return false;
-        uintptr_t ped = 0;
-        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return false;
-        uintptr_t pedVt = 0;
-        if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
-        for (int v = 0; v < NUM_VEH; v++) {
-            uintptr_t veh = 0;
-            if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
-            if (veh == 0) {
-                g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
-                g_velOffset = 0x80; g_ready = true; return true;
-            }
-        }
-        return false;
-    }
-
-    /* Scan game memory for CPedFactory. Scores ALL candidates and picks
-     * the one with the highest reported speed (= real moving player). */
+    /* Initialise by pattern-scanning GTAIV.exe for the FindPlayer* helpers. */
     inline bool Init(uintptr_t gameBase, size_t gameSize) {
         if (g_ready) return true;
+        g_gameBase = gameBase;
+        g_gameSize = gameSize;
 
-        struct PatInfo { BYTE pat[9]; char mask[10]; int addrOff; };
-        PatInfo patterns[] = {
-            { {0xA1,0,0,0,0,0x85,0xC0,0x74,0}, "x????xxx", 1 },
-            { {0x8B,0x0D,0,0,0,0,0x8B,0x41,0x04}, "xx????xxx", 2 },
-            { {0x8B,0x35,0,0,0,0,0x85,0xF6,0x74}, "xx????xxx", 2 },
-        };
-
-        /* Pass 1: SCORED STRICT - find the candidate with the highest speed */
-        uintptr_t bestFactory = 0;
-        int bestVeh = 0, bestVel = 0;
-        float bestScore = 0.0f;
-
-        for (auto& p : patterns) {
-            uintptr_t cur = gameBase;
-            size_t rem = gameSize;
-            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
-                uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
-                if (!hit) break;
-                uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
-                /* Test factory without committing */
-                float s = TryFactoryStrictScored(candidate, gameBase, gameSize);
-                if (s > bestScore) {
-                    bestScore = s;
-                    bestFactory = g_pedFactory;
-                    bestVeh = g_vehOffset;
-                    bestVel = g_velOffset;
-                    /* Reset ready flag - we'll commit best at end */
-                    g_ready = false;
-                }
-                cur = hit + 1;
-                rem = gameBase + gameSize - cur;
-            }
+        /* CE 1.2.0.43 FindPlayerPed: 8B 44 24 04 85 C0 75 18 A1 */
+        {
+            const BYTE pat[] = {0x8B,0x44,0x24,0x04,0x85,0xC0,0x75,0x18,0xA1};
+            uintptr_t hit = FindPattern(gameBase, gameSize, pat, "xxxxxxxxx");
+            if (hit) g_findPlayerPed = (FindFn)hit;
+        }
+        /* CE 1.2.0.43 FindPlayerVehicle: 8B 44 24 04 85 C0 75 15 A1 ? ? ? ? 83 F8 FF 75 04 33 C0 EB 07 */
+        {
+            const BYTE pat[] = {0x8B,0x44,0x24,0x04,0x85,0xC0,0x75,0x15,0xA1,
+                                0,0,0,0,0x83,0xF8,0xFF,0x75,0x04,0x33,0xC0,0xEB,0x07};
+            uintptr_t hit = FindPattern(gameBase, gameSize, pat, "xxxxxxxxx????xxxxxxxxx");
+            if (hit) g_findPlayerVehicle = (FindFn)hit;
         }
 
-        if (bestFactory != 0) {
-            g_pedFactory = bestFactory;
-            g_vehOffset = bestVeh;
-            g_velOffset = bestVel;
-            g_ready = true;
-            return true;
-        }
-
-        /* Pass 2: non-zero velocity (less strict, any heap factory) */
-        for (auto& p : patterns) {
-            uintptr_t cur = gameBase;
-            size_t rem = gameSize;
-            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
-                uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
-                if (!hit) break;
-                uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
-                if (TryFactory(candidate)) return true;
-                cur = hit + 1;
-                rem = gameBase + gameSize - cur;
-            }
-        }
-
-        /* Pass 3: fallback - on-foot */
-        for (auto& p : patterns) {
-            uintptr_t cur = gameBase;
-            size_t rem = gameSize;
-            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
-                uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
-                if (!hit) break;
-                uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
-                if (TryFactoryFallback(candidate)) return true;
-                cur = hit + 1;
-                rem = gameBase + gameSize - cur;
-            }
-        }
-        return false;
+        g_ready = (g_findPlayerPed != nullptr && g_findPlayerVehicle != nullptr);
+        return g_ready;
     }
 
-    /* Get current vehicle speed in km/h. Returns -1 if on foot or error. */
-    inline float GetSpeed() {
-        if (!g_ready) return -1.0f;
-        uintptr_t fp = 0, ped = 0, veh = 0;
-        if (!ReadPtr(g_pedFactory, &fp) || !IsHeapPtr(fp)) return -1.0f;
-        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return -1.0f;
-        if (!ReadPtr(ped + g_vehOffset, &veh)) return -1.0f;
-        if (veh == 0 || !IsHeapPtr(veh)) return -1.0f;
+    /* Return the player's current vehicle, or null if on foot / entering. */
+    inline uintptr_t GetVehicle() {
+        if (!g_findPlayerVehicle) return 0;
+        void* v = g_findPlayerVehicle(0);
+        if (!v || !IsHeapPtr((uintptr_t)v)) return 0;
+        /* Sanity-check: vtable must be inside the game image. */
+        uintptr_t vt = 0;
+        if (!ReadPtr((uintptr_t)v, &vt)) return 0;
+        if (vt < g_gameBase || vt >= g_gameBase + g_gameSize) return 0;
+        return (uintptr_t)v;
+    }
 
-        float vx, vy, vz;
-        uintptr_t vb = veh + g_velOffset;
-        if (!ReadFloat(vb, &vx) || !ReadFloat(vb+4, &vy) || !ReadFloat(vb+8, &vz))
-            return -1.0f;
-        float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
-        return (s >= 0.0f && s <= 500.0f) ? s : 0.0f;
+    /* Auto-pick the right velocity offset the first time a moving vehicle
+     * is seen. After that g_velOffset stays locked. */
+    inline void MaybeRebindVelOffset(uintptr_t veh) {
+        static bool locked = false;
+        if (locked) return;
+        float curSpeed = ReadSpeedAt(veh, g_velOffset);
+        if (curSpeed > 0.5f && curSpeed < 500.f) {
+            locked = true;   /* current offset is producing real speed */
+            return;
+        }
+        /* Try every candidate and lock onto the first that reports motion. */
+        for (int i = 0; i < NUM_VEL_CANDS; i++) {
+            float s = ReadSpeedAt(veh, VEL_CANDIDATES[i]);
+            if (s > 0.5f && s < 500.f) {
+                g_velOffset = VEL_CANDIDATES[i];
+                locked = true;
+                return;
+            }
+        }
+        /* Nothing reads as moving -- vehicle is stationary or we haven't
+         * found the right offset yet. Leave g_velOffset at default. */
+    }
+
+    /* Get current vehicle speed in km/h. Returns -1 if on foot. */
+    inline float GetSpeed() {
+        uintptr_t veh = GetVehicle();
+        if (!veh) return -1.f;
+        MaybeRebindVelOffset(veh);
+        float s = ReadSpeedAt(veh, g_velOffset);
+        if (s < 0.f) return -1.f;
+        return (s > 500.f) ? 0.f : s;
     }
 
     /* Returns true if player is currently in a vehicle */
-    inline bool InVehicle() { return GetSpeed() >= 0.0f; }
+    inline bool InVehicle() { return GetVehicle() != 0; }
 
 } // namespace player
 } // namespace sdk
