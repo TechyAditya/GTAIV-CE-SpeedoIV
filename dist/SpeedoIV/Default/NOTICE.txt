@@ -1,0 +1,17 @@
+SpeedoIV-CE bundled artwork
+============================
+
+Bck.png  -- speedometer dial face
+Pin.png  -- needle
+
+Original artwork (c) retarded_chicken, 2009, distributed with the
+original "SpeedoIV" mod on gtaiv-mods.com.
+
+Only the textures from that release are reused here. None of the
+original SpeedoIV code is included or relied upon; the rendering
+logic in SpeedoIV-CE is an independent reimplementation that targets
+GTA IV Complete Edition (1.2.0.43) + FusionFix/DXVK.
+
+If you want to ship a different skin, drop a folder next to this one
+(e.g. SpeedoIV/MySkin/) containing Bck.png and Pin.png and set
+`SkinFolder = MySkin` in Config.ini.

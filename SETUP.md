@@ -1,135 +1,141 @@
 # SETUP.md
 
-How to set up your local environment if `ENVIRONMENT.md` is missing.
-After completing setup, fill in `ENVIRONMENT.md` with your actual paths.
+One-time bootstrap for new clones. Most of it is automated by
+`setup.ps1`; this file documents what that script does and what to
+do if you'd rather set things up by hand.
 
-## Prerequisites
+## Prerequisites (manual install)
 
-1. **GTA IV Complete Edition** (v1.2.0.43, Rockstar Launcher build).
-2. **FusionFix 5.x or newer** installed in the game folder (provides `d3d9.dll`
-   and `plugins/GTAIV.EFLC.FusionFix.asi`).
+1. **GTA IV Complete Edition** (v1.2.0.43, Rockstar Launcher or Steam).
+2. **FusionFix 5.x+** dropped into the game folder (provides `d3d9.dll`
+   that proxies DXVK / Vulkan, plus `plugins/GTAIV.EFLC.FusionFix.asi`).
+   Get it from https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix.
 3. **Ultimate ASI Loader** installed as `dinput8.dll` in the game folder
-   (any version 9.x).
-4. **Windows 10/11 x64**.
-5. **PowerShell 5.1 or 7+**.
-6. **7-Zip** (for extracting source archives if needed).
+   (any 9.x release). Get it from
+   https://github.com/ThirteenAG/Ultimate-ASI-Loader.
+4. **Windows 10/11 x64**, **PowerShell 5.1+**, **7-Zip**.
 
-## Install 32-bit MinGW GCC
+## One-time script setup
 
-This project targets 32-bit Windows (GTA IV is a 32-bit process). You need
-the **i686** MinGW build, not x86_64.
-
-Recommended: WinLibs 13.2.0 i686 posix-dwarf-ucrt, or any equivalent.
+From the repo root:
 
 ```powershell
-$url = "https://github.com/niXman/mingw-builds-binaries/releases/download/13.2.0-rt_v11-rev1/i686-13.2.0-release-posix-dwarf-ucrt-rt_v11-rev1.7z"
+.\setup.ps1
+```
+
+That does, idempotently:
+
+1. Downloads + extracts 32-bit MinGW i686 GCC 13.2.0 to
+   `%TEMP%\opencode\mingw32\` (only the first time).
+2. Auto-detects (or prompts for once) the GTA IV install folder.
+3. Generates `ENVIRONMENT.md` with the discovered paths + your display
+   resolution + the verified memory layout of CE 1.2.0.43. Gitignored.
+4. Generates `deploy.ps1` -- a single command that builds, kills the
+   running game, copies the ASI into `plugins\`, and relaunches.
+   Gitignored.
+5. Verifies that FusionFix + ASI Loader are in place (warns if not).
+
+Optional flags:
+
+```powershell
+.\setup.ps1 -GameDir "D:\Games\GTAIV"   # specify install path explicitly
+.\setup.ps1 -Force                       # redownload MinGW + overwrite deploy.ps1
+                                         # (ENVIRONMENT.md is never overwritten;
+                                         #  delete it manually to regenerate)
+```
+
+After setup completes:
+
+```powershell
+.\build.ps1                 # build SpeedoIV-CE.asi -> build\ and (if ENVIRONMENT.md
+                            # provides GAME_DIR) auto-install to <game>\plugins\
+.\deploy.ps1                # full build + kill + redeploy + relaunch cycle
+.\build.ps1 -Tools          # also build everything in tools\ to build\*.exe
+.\build.ps1 -ToolsOnly      # skip ASI, just rebuild tools
+```
+
+## Manual fallback (no setup.ps1)
+
+### 1. Install 32-bit MinGW
+
+WinLibs 13.2.0 i686 posix-dwarf-ucrt or equivalent. Anything that gives
+you `i686-w64-mingw32-g++.exe` with `libd3dx9_40.a` available is fine.
+
+```powershell
+$url  = "https://github.com/niXman/mingw-builds-binaries/releases/download/13.2.0-rt_v11-rev1/i686-13.2.0-release-posix-dwarf-ucrt-rt_v11-rev1.7z"
 $dest = "$env:TEMP\opencode\mingw32.7z"
 Invoke-WebRequest -Uri $url -OutFile $dest
 & "C:\Program Files\7-Zip\7z.exe" x $dest -o"$env:TEMP\opencode\mingw32"
 ```
 
 Verify:
+
 ```powershell
 & "$env:TEMP\opencode\mingw32\mingw32\bin\g++.exe" --version
-# Expect: gcc.exe (i686-posix-dwarf-rev1, Built by MinGW-Builds project) 13.2.0
+# gcc.exe ... 13.2.0
 ```
 
-The MinGW distribution ships with `libd3dx9_40.a` and the `d3dx9.h` headers
-needed for sprite/texture rendering. No DirectX SDK install required.
+### 2. Game skin assets
 
-## SpeedoIV Skin Assets
-
-The project ports the original SpeedoIV by o!nko!nk (2009) with the
-"retarded_chicken" skin (v1.0.1, 2020). Download the skin archive and
-extract its `SpeedoIV/` subfolder into the game directory:
+The bundled artwork lives in `<game>\SpeedoIV\Default\Bck.png` /
+`Pin.png`. Originally extracted from
+`1672676969_SpeedoIV_skin_ by_retarded_chicken_v1.0.1.7z`. Layout:
 
 ```
-<game folder>\SpeedoIV\
+<game>\SpeedoIV\
     Config.ini
     Default\
-        Bck.png      (modern dial)
-        Bck_orig.png (alternate dial)
+        Bck.png      (dial face)
         Pin.png      (needle)
-        Pin_orig.png (alternate needle)
+        NOTICE.txt   (credits)
 ```
 
-Source: search for `1672676969_SpeedoIV_skin_ by_retarded_chicken_v1.0.1.7z`
-on GTA modding sites if you don't already have it.
+To ship a different skin, drop a folder beside `Default\` containing
+its own `Bck.png` / `Pin.png` and set `SkinFolder = MyFolder` in
+`Config.ini`. The plugin re-reads the file every ~1 second.
 
-## Fill in ENVIRONMENT.md
+### 3. ENVIRONMENT.md and deploy.ps1 by hand
 
-Create `ENVIRONMENT.md` (it's `.gitignore`d) with at minimum:
-- Game install path
-- Path to 32-bit `g++.exe`
-- Path to 7-Zip
-- Display resolution and aspect ratio
+If you didn't run `setup.ps1`, write the minimal `ENVIRONMENT.md`:
 
-See the original `ENVIRONMENT.md` (or `AGENTS.md` references to it) for the
-expected keys.
-
-## Build and Deploy
-
-Create a `deploy.ps1` script in the repo root (it's `.gitignore`d -- each
-developer keeps their own with local paths). Template:
-
-```powershell
-# deploy.ps1 - Build, kill game, deploy ASI, relaunch
-$ErrorActionPreference = 'Stop'
-$gcc        = "<path to i686 g++.exe>"
-$src        = "$PSScriptRoot\speedometer.cpp"
-$out        = "$PSScriptRoot\build\SpeedoIV-CE.asi"
-$gameDir    = "<path to GTA IV install>"
-$gameExe    = "$gameDir\GTAIV.exe"
-$pluginDir  = "$gameDir\plugins"
-
-# Build
-Write-Host "Building..." -NoNewline
-New-Item -ItemType Directory -Path "$PSScriptRoot\build" -Force | Out-Null
-& $gcc $src `
-    -shared -o $out `
-    -std=c++17 -O2 -s -static `
-    -I $PSScriptRoot `
-    -ld3dx9_40 -ld3d9 -lgdi32 -luser32 -lkernel32 `
-    "-Wl,--kill-at" 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Host " FAILED" -ForegroundColor Red; exit 1 }
-$size = [math]::Round((Get-Item $out).Length / 1KB, 1)
-Write-Host " OK ($size KB)"
-
-# Kill running game
-$p = Get-Process "GTAIV" -ErrorAction SilentlyContinue
-if ($p) {
-    Write-Host "Killing GTAIV (PID $($p.Id))..."
-    $p | Stop-Process -Force
-    Start-Sleep -Seconds 3
-}
-
-# Deploy and launch
-Copy-Item $out (Join-Path $pluginDir "SpeedoIV-CE.asi") -Force
-Write-Host "Deployed to $pluginDir"
-Start-Process -FilePath $gameExe -WorkingDirectory $gameDir
-Write-Host "Game launched"
+```
+GAME_DIR = "C:\path\to\Grand Theft Auto IV - The Complete Edition"
 ```
 
-Then run:
-```powershell
-cd <repo>
-.\deploy.ps1
-```
+`build.ps1` reads that line to auto-install after a successful build.
+For a custom deploy loop, see the generated `deploy.ps1` (or copy the
+template from `setup.ps1`).
 
-## Verifying the Hook
+## Verifying the install
 
-After launch, check the runtime log (path in ENVIRONMENT.md). You should see:
-- `d3d9hook: FOUND RAGE wrapper at +0x250E9` (or similar)
-- `d3d9hook: Hooked Reset` and `Hook installed`
-- `Game init: offsets OK`
-- `D3D resources loaded OK`
-- `Frame N: visible=1 speed=X.X resOk=1`
+After running the game once with the ASI loaded, check:
 
-If `speed` stays at 0 while you're driving, re-launch and immediately drive
-fast (>30 km/h) -- the pattern scanner picks the candidate with the highest
-reported speed, so you need to be moving when it runs.
+- The runtime log only appears if `Debug = true` in `Config.ini` OR
+  there was a warning/error -- by design, Debug=false stays silent.
+- With `Debug = true` the log should contain (in this order):
+  - `SpeedoIV-CE starting...`
+  - `Game module: base=0x00FE0000 size=0x01BE6400`
+  - `d3d9hook: FOUND RAGE wrapper at +0x250E9 ...`
+  - `d3d9hook: Hook installed`
+  - `Game init: player=OK ui=OK (FindPlayerPed=0x014B1C10 ...)`
+  - `D3D resources loaded OK`
+  - `Frame N: visible=1 speed=X.X velOff=0x1270 resOk=1` every 300 frames.
 
-## Config Live-Reload
+If `Game init: player=FAILED`, your build's `FindPlayerPed` pattern
+doesn't match -- you're not on CE 1.2.0.43, or the executable was
+modified. Run `tools\probe_vehicle.exe` while the game is running to
+re-extract the function address.
 
-`Config.ini` is re-read every ~1 second. You can edit position/size/colors
-without restarting the game.
+## Live tunable config
+
+Edit `<game>\SpeedoIV\Config.ini` while the game is running -- the
+plugin re-reads it about once per second. Useful knobs:
+
+- `Debug` -- true for verbose log file, false for silent + lazy on error.
+- `PositionX` / `PositionY`, `SizeX` / `SizeY`, `ScreenAlign` -- on-screen layout.
+- `Angle` -- static rotation of the whole speedometer.
+- `SweepDeg` -- needle arc from 0 to MaxSpeed (default 280 for the bundled dial).
+- `MaxSpeed` -- top of the dial in km/h.
+- `Alpha` -- 0-255 opacity.
+- `ToggleKey` -- numeric VK code (117 = F6 by default; avoid F5 = GTA quicksave).
+- `SkinFolder` -- name of the subfolder under `SpeedoIV\` to load `Bck.png`/`Pin.png` from.

@@ -119,10 +119,31 @@ From `source/turnindicators.ixx` and other CE-tagged code:
 - `CVehicle::steerAngleOffset` = `0x1088` (CE) / `0x10D8` (legacy)
 - `CVehicle::flagsOffset` = `0xF16` (CE) / `0xF66` (legacy)
 
-SpeedoIV-CE independently discovered:
-- Player CPed -> CVehicle pointer at ped + `0x32C` (CE)
-- CVehicle -> velocity vector at vehicle + `0x80` (CE)
-- (CPedFactory + `0x4` -> player CPed, same as legacy)
+SpeedoIV-CE additionally verified via live probes (see `tools/`):
+
+- **`FindPlayerPed` @ `0x014B1C10`** -- entry point of the game's
+  `void* (__cdecl)(int id)` helper. Same pattern FusionFix uses
+  (`source/comvars.ixx:2798`). Returns `playerInfo->m_pPed` when
+  called with id=0.
+- **`FindPlayerVehicle` @ `0x014B1C40`** -- the corresponding vehicle
+  helper. Returns `ped->m_pMyVehicle` if `inVehicle` flag set.
+- **`CPlayerInfo + 0x598` -> `CPed*`**, **`CPed + 0xB30` -> `CVehicle*`**,
+  **`CPed + 0x26C` bit 2** = inVehicle flag (from disassembling the
+  helpers above).
+- **`CVehicle + 0x1270` -> vec3 m/s** velocity vector. This was the
+  one offset that actually moved with real driving (60.78 -> 64.75
+  -> 63.95 km/h across three 1s-apart snapshots). Earlier guesses
+  of `0x70 / 0x80 / 0xF8` were stationary scalars that coincidentally
+  matched once. See `ISSUES.md` #20.
+- **`CTimer::m_UserPause` @ `0x01D53590`**, **`m_CodePause` @ `0x01D53591`**
+  -- byte flags; either non-zero means the game world is frozen.
+- **`CMenuManager::m_MenuActive` @ `0x01D409F6`** -- byte flag for any
+  blocking menu (pause, map, brief, stats, etc.).
+
+The factory-globals approach (`CPedFactory* -> playerPed -> vehicle`)
+from the very first iteration is gone -- it picks the wrong factory
+when the player is stationary. The `FindPlayerVehicle` function-call
+approach is the right one. See `ISSUES.md` #17.
 
 ## Build / Runtime Info
 

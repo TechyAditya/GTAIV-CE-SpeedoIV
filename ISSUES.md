@@ -399,3 +399,69 @@ CE offset.
 - Sub-object scan is critical: GTAIV's CVehicle has nested
   CPhysical-derived data that's reached via internal pointers --
   velocity often lives in one of those, not in the parent struct.
+
+---
+
+## 21. Refactor into sdk/ + tools/ + one-time setup.ps1
+
+**Finding**: After the velocity fix the project worked end-to-end, but
+the codebase was a flat pile of files (gtaiv_sdk.h, d3d9_hook.h,
+speedometer.cpp, plus 10 dev probes at the root) with no clear path
+for reusing the SDK in a different mod. Setup required hand-rolling
+ENVIRONMENT.md and deploy.ps1 from a SETUP.md template.
+
+**Fix**:
+
+1. Split `gtaiv_sdk.h` + `d3d9_hook.h` into `sdk/*.h`:
+   `logging.h`, `memory.h`, `scanner.h`, `game.h`, `ui.h`,
+   `player.h`, `d3d9_hook.h`, `render.h`, plus an umbrella
+   `all.h`. Each header has one responsibility and a top-of-file
+   comment explaining its API.
+2. Moved 10 dev probes into `tools/`. `build.ps1 -Tools` rebuilds
+   them all. Probe output paths are still hardcoded to
+   `build\probe_*.txt` (they live at the repo root regardless of
+   tool location, so still works).
+3. New `sdk/render.h` extracts the D3DX9 helpers from speedometer.cpp:
+   `LoadTexture` (DXVK-friendly), `Reset2DState`,
+   `BuildSpriteTransform` (correct rotation pivot in scaled coords),
+   `ResolveAlignment`. The render block in speedometer.cpp shrank
+   from ~150 lines to ~30 of just configuration + `Begin/Draw/End`.
+4. New `sdk/logging.h` adds a Debug flag with two modes:
+   - `Debug=true`: truncate the log on first call, write every line
+     immediately (the old behaviour).
+   - `Debug=false`: do not open the log file. Info-level calls go to
+     a 64-entry ring buffer. On first warn/error, lazy-open the file in
+     APPEND mode, flush the ring under a `--- buffered context ---`
+     header, then write the warning. Quiet by default, contextual when
+     it matters, never wipes history without consent.
+5. Added `setup.ps1` as the one-time bootstrap:
+   - Downloads + extracts 32-bit MinGW 13.2.0 i686 if missing.
+   - Auto-detects the game folder (Rockstar, Steam, common drive paths)
+     or prompts once.
+   - Generates `ENVIRONMENT.md` (first time only -- it's agent-managed
+     after that).
+   - Generates `deploy.ps1` with the discovered paths. The new
+     `deploy.ps1` kills the game FIRST then calls `build.ps1`,
+     fixing the file-lock race where `build.ps1` tried to overwrite
+     the deployed ASI before the running game released its handle.
+6. Added `README.md` as the human-facing entry point. Credits
+   `retarded_chicken` for the bundled artwork (assets only -- no
+   logic reused) and `FusionFix` / `ThirteenAG` for the
+   pattern-scan blueprint. `NOTICE.txt` placed alongside the
+   artwork in `SpeedoIV/Default/`.
+7. `build.ps1` reads `GAME_DIR = "..."` from `ENVIRONMENT.md`
+   and auto-installs the built ASI into `<game>\plugins\`.
+
+**Lessons**:
+- A one-file SDK is fine until you want to ship it. The split into
+  per-responsibility headers makes drop-in reuse for a new ASI mod a
+  matter of copying the `sdk/` folder.
+- Debug-by-default logs grow without bound and clutter the game folder.
+  Lazy-open + ring-buffer means we still get diagnostic value on the
+  rare occasions something goes wrong, without paying the disk cost on
+  every launch.
+- PowerShell here-strings need bare `-Wl,--kill-at` followed by a
+  `)`-closed array literal, not a backtick-continued line. Backtick
+  line continuations choke when there's trailing whitespace or a
+  comma immediately before a newline -- the parser produces
+  `Missing argument in parameter list` with no useful line number.

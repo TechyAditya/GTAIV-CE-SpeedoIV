@@ -1,17 +1,22 @@
 /*
- * SpeedoIV-CE - Speedometer for GTA IV Complete Edition (1.2.0.43)
+ * SpeedoIV-CE - Speedometer overlay for GTA IV Complete Edition (1.2.0.43)
  *
- * Port of the original SpeedoIV with custom skins.
- * Compatible with FusionFix (DXVK).
+ * Reads live vehicle velocity, hides during pause/menu/cutscene, supports
+ * live-tunable position/size/sweep from Config.ini and a toggle hotkey.
  *
- * Uses: gtaiv_sdk.h (game data) + d3d9_hook.h (rendering hook)
+ * Credits:
+ *   - Bck.png / Pin.png assets and the original SpeedoIV concept
+ *     (c) retarded_chicken (gtaiv-mods.com, 2009). Logic was NOT used,
+ *     but the artwork remains.
+ *   - FindPlayerPed / FindPlayerVehicle / pause-state patterns
+ *     derived from FusionFix (https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix)
+ *     by ThirteenAG, GPL-3.0.
+ *
+ * Build: see build.ps1 (32-bit MinGW i686 + D3DX9).
  */
 
 #define _USE_MATH_DEFINES
-#include "gtaiv_sdk.h"
-#include "d3d9_hook.h"
-#include <d3d9.h>
-#include <d3dx9.h>
+#include "sdk/all.h"
 #include <cmath>
 
 #ifndef M_PI
@@ -22,19 +27,21 @@
  * Config
  * ========================================================================== */
 struct Config {
+    bool  debug       = false;
     bool  autostart   = true;
-    int   toggleKey   = VK_F5;
-    float texSizeX    = 300.f;
-    float texSizeY    = 300.f;
+    int   toggleKey   = VK_F6;
+    float texSizeX    = 1024.f;
+    float texSizeY    = 1024.f;
     bool  kmh         = true;
-    float maxSpeed    = 300.f;
+    float maxSpeed    = 280.f;
     char  align[4]    = "BL";
-    float posX        = 26.5f;
-    float posY        = -3.f;
-    float sizeX       = 242.f;
-    float sizeY       = 234.f;
+    float posX        = 90.f;
+    float posY        = 12.f;
+    float sizeX       = 440.f;
+    float sizeY       = 440.f;
     float angle       = 0.f;
-    int   alpha       = 240;
+    float sweepDeg    = 280.f;
+    int   alpha       = 220;
     char  skin[64]    = "Default";
 };
 
@@ -48,61 +55,74 @@ static bool     g_visible = true;
 static ID3DXSprite*       g_sprite = NULL;
 static IDirect3DTexture9* g_texBck = NULL;
 static IDirect3DTexture9* g_texPin = NULL;
-static ID3DXFont*         g_font   = NULL;
 static bool               g_resOk  = false;
 
 /* ==========================================================================
  * Config Loading
  * ========================================================================== */
-static void LoadConfig() {
+static void GetIniPath(char* out, size_t cap) {
     char base[MAX_PATH];
     GetModuleFileNameA(g_hModule, base, MAX_PATH);
-    /* plugins\SpeedoIV-CE.asi -> go up to game root */
+    char* s = strrchr(base, '\\'); if (s) *s = 0;   /* drop SpeedoIV-CE.asi */
+    s = strrchr(base, '\\'); if (s) *s = 0;          /* drop plugins\ */
+    snprintf(out, cap, "%s\\SpeedoIV\\Config.ini", base);
+}
+
+static void GetSkinDir(char* out, size_t cap, const char* skin) {
+    char base[MAX_PATH];
+    GetModuleFileNameA(g_hModule, base, MAX_PATH);
     char* s = strrchr(base, '\\'); if (s) *s = 0;
     s = strrchr(base, '\\'); if (s) *s = 0;
+    snprintf(out, cap, "%s\\SpeedoIV\\%s", base, skin);
+}
 
+static void LoadConfig() {
     char ini[MAX_PATH];
-    snprintf(ini, MAX_PATH, "%s\\SpeedoIV\\Config.ini", base);
+    GetIniPath(ini, MAX_PATH);
 
     auto getF = [&](const char* key, float def) -> float {
-        char buf[32];
-        char defStr[32]; snprintf(defStr, 32, "%.2f", def);
+        char buf[32]; char defStr[32];
+        snprintf(defStr, 32, "%.2f", def);
         GetPrivateProfileStringA("Config", key, defStr, buf, 32, ini);
         return (float)atof(buf);
     };
-
     auto getBool = [&](const char* key, bool def) -> bool {
         char buf[16];
         GetPrivateProfileStringA("Config", key, def ? "true" : "false", buf, 16, ini);
         return (_stricmp(buf, "true") == 0 || _stricmp(buf, "1") == 0 ||
-                _stricmp(buf, "yes") == 0);
+                _stricmp(buf, "yes")  == 0 || _stricmp(buf, "on") == 0);
     };
 
+    g_cfg.debug     = getBool("Debug", false);
     g_cfg.autostart = getBool("Autostart", true);
-    g_cfg.toggleKey = GetPrivateProfileIntA("Config", "ToggleKey", VK_F5, ini);
-    g_cfg.texSizeX  = getF("TexSizeX", 300.f);
-    g_cfg.texSizeY  = getF("TexSizeY", 300.f);
+    g_cfg.toggleKey = GetPrivateProfileIntA("Config", "ToggleKey", VK_F6, ini);
+    g_cfg.texSizeX  = getF("TexSizeX", 1024.f);
+    g_cfg.texSizeY  = getF("TexSizeY", 1024.f);
     g_cfg.kmh       = getBool("EnableKMH", true);
-    g_cfg.maxSpeed  = getF("MaxSpeed", 300.f);
-    g_cfg.posX      = getF("PositionX", 26.5f);
-    g_cfg.posY      = getF("PositionY", -3.f);
-    g_cfg.sizeX     = getF("SizeX", 242.f);
-    g_cfg.sizeY     = getF("SizeY", 234.f);
+    g_cfg.maxSpeed  = getF("MaxSpeed", 280.f);
+    g_cfg.posX      = getF("PositionX", 90.f);
+    g_cfg.posY      = getF("PositionY", 12.f);
+    g_cfg.sizeX     = getF("SizeX", 440.f);
+    g_cfg.sizeY     = getF("SizeY", 440.f);
     g_cfg.angle     = getF("Angle", 0.f);
-    g_cfg.alpha     = GetPrivateProfileIntA("Config", "Alpha", 240, ini);
-    GetPrivateProfileStringA("Config", "SkinFolder", "Default", g_cfg.skin, 64, ini);
-    GetPrivateProfileStringA("Config", "ScreenAlign", "BL", g_cfg.align, 4, ini);
+    g_cfg.sweepDeg  = getF("SweepDeg", 280.f);
+    g_cfg.alpha     = GetPrivateProfileIntA("Config", "Alpha", 220, ini);
+    GetPrivateProfileStringA("Config", "SkinFolder",  "Default", g_cfg.skin,  64, ini);
+    GetPrivateProfileStringA("Config", "ScreenAlign", "BL",      g_cfg.align,  4, ini);
 
-    /* Quiet by default - only log once at startup */
+    /* Propagate Debug flag to logger -- responds live so user can flip it
+     * mid-session and start seeing logs immediately. */
+    sdk::SetDebug(g_cfg.debug);
+
     static bool firstLoad = true;
     if (firstLoad) {
         g_visible = g_cfg.autostart;
-        sdk::Log("Config loaded: autostart=%d kmh=%d maxSpeed=%.0f skin=%s align=%s size=%.0fx%.0f pos=%.1f,%.1f",
-                 g_cfg.autostart, g_cfg.kmh, g_cfg.maxSpeed, g_cfg.skin, g_cfg.align,
-                 g_cfg.sizeX, g_cfg.sizeY, g_cfg.posX, g_cfg.posY);
+        sdk::Log("Config loaded: debug=%d autostart=%d kmh=%d maxSpeed=%.0f skin=%s align=%s size=%.0fx%.0f pos=%.1f,%.1f sweep=%.0f toggleKey=%d",
+                 g_cfg.debug, g_cfg.autostart, g_cfg.kmh, g_cfg.maxSpeed,
+                 g_cfg.skin, g_cfg.align, g_cfg.sizeX, g_cfg.sizeY,
+                 g_cfg.posX, g_cfg.posY, g_cfg.sweepDeg, g_cfg.toggleKey);
         firstLoad = false;
     }
-    /* Don't overwrite g_visible on reload -- user F5 toggle should persist */
 }
 
 /* ==========================================================================
@@ -111,44 +131,25 @@ static void LoadConfig() {
 static bool InitResources(IDirect3DDevice9* dev) {
     if (g_resOk) return true;
 
-    char base[MAX_PATH];
-    GetModuleFileNameA(g_hModule, base, MAX_PATH);
-    char* s = strrchr(base, '\\'); if (s) *s = 0;
-    s = strrchr(base, '\\'); if (s) *s = 0;
-
+    char skinDir[MAX_PATH];
+    GetSkinDir(skinDir, MAX_PATH, g_cfg.skin);
     char bck[MAX_PATH], pin[MAX_PATH];
-    /* Use the modern skin textures */
-    snprintf(bck, MAX_PATH, "%s\\SpeedoIV\\%s\\Bck.png", base, g_cfg.skin);
-    snprintf(pin, MAX_PATH, "%s\\SpeedoIV\\%s\\Pin.png", base, g_cfg.skin);
-    sdk::Log("Loading bck: %s", bck);
-    sdk::Log("Loading pin: %s", pin);
+    snprintf(bck, MAX_PATH, "%s\\Bck.png", skinDir);
+    snprintf(pin, MAX_PATH, "%s\\Pin.png", skinDir);
+    sdk::Log("Loading textures from %s", skinDir);
 
     if (FAILED(D3DXCreateSprite(dev, &g_sprite))) {
-        sdk::Log("Failed: D3DXCreateSprite"); return false;
+        sdk::LogError("D3DXCreateSprite failed"); return false;
     }
-    /* Load textures preserving original format, with D3DPOOL_DEFAULT for DXVK */
-    if (FAILED(D3DXCreateTextureFromFileExA(dev, bck,
-            D3DX_DEFAULT, D3DX_DEFAULT, 1, 0,
-            D3DFMT_UNKNOWN, D3DPOOL_DEFAULT,
-            D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &g_texBck))) {
-        sdk::Log("Failed: load %s", bck); return false;
+    if (!sdk::render::LoadTexture(dev, bck, &g_texBck)) return false;
+    if (!sdk::render::LoadTexture(dev, pin, &g_texPin)) return false;
+
+    int tw = 0, th = 0;
+    if (sdk::render::GetTextureSize(g_texBck, &tw, &th)) {
+        sdk::Log("Bck texture: %dx%d", tw, th);
+        g_cfg.texSizeX = (float)tw;
+        g_cfg.texSizeY = (float)th;
     }
-    if (FAILED(D3DXCreateTextureFromFileExA(dev, pin,
-            D3DX_DEFAULT, D3DX_DEFAULT, 1, 0,
-            D3DFMT_UNKNOWN, D3DPOOL_DEFAULT,
-            D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &g_texPin))) {
-        sdk::Log("Failed: load %s", pin); return false;
-    }
-    /* Get texture dimensions to use as texSize (auto-detect) */
-    D3DSURFACE_DESC desc;
-    if (SUCCEEDED(g_texBck->GetLevelDesc(0, &desc))) {
-        sdk::Log("Bck texture: %dx%d format=%d", desc.Width, desc.Height, desc.Format);
-        g_cfg.texSizeX = (float)desc.Width;
-        g_cfg.texSizeY = (float)desc.Height;
-    }
-    D3DXCreateFontA(dev, 22, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                    DEFAULT_PITCH | FF_DONTCARE, "Arial", &g_font);
 
     g_resOk = true;
     sdk::Log("D3D resources loaded OK");
@@ -159,7 +160,6 @@ static void ReleaseResources() {
     if (g_sprite) { g_sprite->Release(); g_sprite = NULL; }
     if (g_texBck) { g_texBck->Release(); g_texBck = NULL; }
     if (g_texPin) { g_texPin->Release(); g_texPin = NULL; }
-    if (g_font)   { g_font->Release();   g_font = NULL; }
     g_resOk = false;
 }
 
@@ -169,7 +169,6 @@ static void ReleaseResources() {
 static IDirect3DDevice9* g_lastDev = NULL;
 
 static void Render(IDirect3DDevice9* dev, float speed) {
-    /* Check device state - DXVK reports DEVICELOST on alt+tab from fullscreen */
     HRESULT coop = dev->TestCooperativeLevel();
     if (coop == D3DERR_DEVICELOST) {
         if (g_resOk) { sdk::Log("Device lost - releasing"); ReleaseResources(); }
@@ -177,145 +176,60 @@ static void Render(IDirect3DDevice9* dev, float speed) {
     }
     if (coop == D3DERR_DEVICENOTRESET) return;
 
-    /* Get the device's focus window from its swapchain - if it's not 
-     * visible/active, skip rendering to avoid DXVK crashes */
     IDirect3DSwapChain9* swap = NULL;
     if (SUCCEEDED(dev->GetSwapChain(0, &swap))) {
         D3DPRESENT_PARAMETERS pp = {};
         swap->GetPresentParameters(&pp);
         swap->Release();
-        if (pp.hDeviceWindow) {
-            if (!IsWindowVisible(pp.hDeviceWindow) || IsIconic(pp.hDeviceWindow)) {
-                if (g_resOk) { sdk::Log("Window hidden - releasing"); ReleaseResources(); }
-                return;
-            }
+        if (pp.hDeviceWindow && (!IsWindowVisible(pp.hDeviceWindow) || IsIconic(pp.hDeviceWindow))) {
+            if (g_resOk) { sdk::Log("Window hidden - releasing"); ReleaseResources(); }
+            return;
         }
     }
 
-    /* Device change detection */
     if (dev != g_lastDev) {
         if (g_lastDev != NULL && g_resOk) ReleaseResources();
         g_lastDev = dev;
     }
-
     if (!InitResources(dev)) return;
 
-    /* Force clean render states - GTA leaves the device in weird state after
-     * its rendering passes (tonemap, depth-of-field). Reset to defaults. */
-    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
-    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
-    /* Disable any pixel shaders that might be active */
-    dev->SetPixelShader(NULL);
-    dev->SetVertexShader(NULL);
-    /* Reset texture stage state */
-    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    sdk::render::Reset2DState(dev);
 
     D3DVIEWPORT9 vp;
     dev->GetViewport(&vp);
     float scrW = (float)vp.Width, scrH = (float)vp.Height;
 
-    /* Position with intuitive offsets:
-     * - For BL/BR: posY moves UP from bottom (positive = up), posX moves RIGHT for BL or LEFT for BR
-     * - For TL/TR: posY moves DOWN from top */
-    float drawX, drawY;
-    if (g_cfg.align[0] == 'B' || g_cfg.align[0] == 'b')
-        drawY = scrH - g_cfg.sizeY - g_cfg.posY;
-    else
-        drawY = g_cfg.posY;
-    if (g_cfg.align[1] == 'R' || g_cfg.align[1] == 'r')
-        drawX = scrW - g_cfg.sizeX - g_cfg.posX;
-    else
-        drawX = g_cfg.posX;
+    float drawX = 0, drawY = 0;
+    sdk::render::ResolveAlignment(g_cfg.align, scrW, scrH,
+                                  g_cfg.sizeX, g_cfg.sizeY,
+                                  g_cfg.posX,  g_cfg.posY,
+                                  &drawX, &drawY);
 
-    /* Pin already points at the "0" position in the texture (bottom-left of dial).
-     * Rotate it clockwise from 0deg (speed=0) to +270deg (speed=maxSpeed). */
     float ratio = speed / g_cfg.maxSpeed;
     if (ratio < 0.f) ratio = 0.f;
     if (ratio > 1.f) ratio = 1.f;
-    float needleRad = ratio * 270.f * (float)M_PI / 180.f;
-    float userRad = g_cfg.angle * (float)M_PI / 180.f;
-
-    /* D3DXMatrixTransformation2D applies (in order):
-     *   1. translate by -scalingCenter
-     *   2. scale
-     *   3. translate by +scalingCenter
-     *   4. translate by -rotationCenter
-     *   5. rotate
-     *   6. translate by +rotationCenter
-     *   7. translate by +translation
-     *
-     * For a sprite the destination is the texture's (0,0) corner placed at
-     * `translation` if both centers are (0,0). To rotate the sprite around
-     * its visual centre and place that centre at (drawX + sizeX/2,
-     * drawY + sizeY/2), we use ONE shared centre = (texSize/2, texSize/2)
-     * for scaling AND rotation, and set translation so that after the
-     * full transform the texture centre lands where we want it.
-     *
-     * With shared centre C = (texSize/2, texSize/2):
-     *   - scaling step maps texel C to itself (C is the scaling pivot, but
-     *     because the matrix uses C for BOTH pivots and scale happens before
-     *     rotation, after scaling the visual centre of the sprite is at C
-     *     in unscaled texel space).
-     *   - rotation step rotates around C -> C stays at C.
-     *   - final translation adds (drawX + sizeX/2 - C.x, drawY + sizeY/2 - C.y)
-     *     so that C ends up at (drawX + sizeX/2, drawY + sizeY/2).
-     *
-     * Actually simpler: keep translation = (drawX, drawY) and use a single
-     * pivot at scaled centre. Scale must apply first so the rotation pivot
-     * is in *scaled* coords. D3DX scales around scalingCenter (which is in
-     * texel coords), then rotates around rotationCenter (also texel coords)
-     * after scaling -- meaning rotationCenter is interpreted post-scale.
-     *
-     * Verified by D3DX docs: rotationCenter is in pre-scale texel space
-     * BUT the rotation is applied to already-scaled geometry, so we should
-     * pass rotationCenter in scaled units. We'll bypass the issue by using
-     * scalingCenter = rotationCenter = (0,0) and pre-computing translation
-     * so the sprite's scaled centre is at the requested screen point. */
+    float needleRad = ratio * g_cfg.sweepDeg * (float)M_PI / 180.f;
+    float userRad   = g_cfg.angle * (float)M_PI / 180.f;
 
     float scaleX = g_cfg.sizeX / g_cfg.texSizeX;
     float scaleY = g_cfg.sizeY / g_cfg.texSizeY;
-    float cx = drawX + g_cfg.sizeX * 0.5f;   /* desired centre on screen */
+    float cx = drawX + g_cfg.sizeX * 0.5f;
     float cy = drawY + g_cfg.sizeY * 0.5f;
-
-    D3DXVECTOR2 zero(0.f, 0.f);
-    D3DXVECTOR2 scale(scaleX, scaleY);
-    /* Rotation pivot in scaled space = scaled texture centre */
-    D3DXVECTOR2 rotCenter(g_cfg.texSizeX * 0.5f * scaleX,
-                          g_cfg.texSizeY * 0.5f * scaleY);
-    /* Translation places scaled (0,0) corner so that scaled centre lands at (cx,cy) */
-    D3DXVECTOR2 pos(cx - rotCenter.x, cy - rotCenter.y);
 
     DWORD bgColor  = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
     DWORD pinColor = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
 
+    D3DXMATRIX mat;
     g_sprite->Begin(D3DXSPRITE_ALPHABLEND);
 
-    D3DXMATRIX mat;
-    /* Background: only user-configured rotation (usually 0) */
-    D3DXMatrixTransformation2D(&mat, &zero, 0.f, &scale, &rotCenter, userRad, &pos);
+    sdk::render::BuildSpriteTransform(&mat, g_cfg.texSizeX, g_cfg.texSizeY,
+                                      scaleX, scaleY, cx, cy, userRad);
     g_sprite->SetTransform(&mat);
     g_sprite->Draw(g_texBck, NULL, NULL, NULL, bgColor);
 
-    /* Needle: speed-driven rotation, same pivot/scale/translation */
-    D3DXMatrixTransformation2D(&mat, &zero, 0.f, &scale, &rotCenter,
-                               needleRad + userRad, &pos);
+    sdk::render::BuildSpriteTransform(&mat, g_cfg.texSizeX, g_cfg.texSizeY,
+                                      scaleX, scaleY, cx, cy,
+                                      needleRad + userRad);
     g_sprite->SetTransform(&mat);
     g_sprite->Draw(g_texPin, NULL, NULL, NULL, pinColor);
 
@@ -328,25 +242,31 @@ static void Render(IDirect3DDevice9* dev, float speed) {
 static bool g_gameInit = false;
 
 static void OnFrame(IDirect3DDevice9* dev) {
-    /* One-time game data init */
     if (!g_gameInit) {
         auto mod = sdk::GetGameModule();
-        if (mod.valid) sdk::player::Init(mod.base, mod.size);
+        if (mod.valid) {
+            sdk::player::Init(mod.base, mod.size);
+            sdk::ui::Init(mod.base, mod.size);
+        }
         LoadConfig();
         g_gameInit = true;
-        sdk::Log("Game init: %s (FindPlayerPed=0x%08X FindPlayerVehicle=0x%08X)",
+        sdk::Log("Game init: player=%s ui=%s (FindPlayerPed=0x%08X FindPlayerVehicle=0x%08X UserPause=0x%08X CodePause=0x%08X MenuActive=0x%08X)",
                  sdk::player::g_ready ? "OK" : "FAILED",
+                 sdk::ui::g_ready ? "OK" : "FAILED",
                  (unsigned)(uintptr_t)sdk::player::g_findPlayerPed,
-                 (unsigned)(uintptr_t)sdk::player::g_findPlayerVehicle);
+                 (unsigned)(uintptr_t)sdk::player::g_findPlayerVehicle,
+                 (unsigned)(uintptr_t)sdk::ui::g_userPause,
+                 (unsigned)(uintptr_t)sdk::ui::g_codePause,
+                 (unsigned)(uintptr_t)sdk::ui::g_menuActive);
+        if (!sdk::player::g_ready) sdk::LogError("Player module init failed");
+        if (!sdk::ui::g_ready)     sdk::LogWarn("UI/pause module init failed -- speedometer will not auto-hide on pause");
     }
 
-    /* Live-reload Config.ini every ~1 second so you can tune without restarting */
+    /* Live-reload Config.ini every ~1 second so the user can tune without restarting */
     static int reloadFrame = 0;
-    if (++reloadFrame % 60 == 0) {
-        LoadConfig();
-    }
+    if (++reloadFrame % 60 == 0) LoadConfig();
 
-    /* Toggle key */
+    /* Toggle key (edge-triggered) */
     static bool keyPrev = false;
     bool keyNow = (GetAsyncKeyState(g_cfg.toggleKey) & 0x8000) != 0;
     if (keyNow && !keyPrev) {
@@ -355,7 +275,7 @@ static void OnFrame(IDirect3DDevice9* dev) {
     }
     keyPrev = keyNow;
 
-    /* Periodic status log */
+    /* Heartbeat log (Debug=true only via ring buffer otherwise) */
     static int frame = 0;
     if (++frame % 300 == 1) {
         float spd = sdk::player::g_ready ? sdk::player::GetSpeed() : -99.0f;
@@ -363,12 +283,13 @@ static void OnFrame(IDirect3DDevice9* dev) {
                  frame, g_visible, spd, sdk::player::g_velOffset, g_resOk);
     }
 
-    /* Render whenever visible. Show 0 km/h when on foot so the dial stays
-     * usable as a reference and recovers cleanly from alt+tab. */
+    /* Render only when visible, player is loaded, actually in a vehicle,
+     * and the game is not paused/menu/cutscene. */
     if (g_visible && sdk::player::g_ready) {
         float speed = sdk::player::GetSpeed();
-        if (speed < 0.f) speed = 0.f;
-        Render(dev, speed);
+        if (speed >= 0.f && !sdk::ui::IsGamePaused()) {
+            Render(dev, speed);
+        }
     }
 }
 
@@ -376,13 +297,16 @@ static void OnFrame(IDirect3DDevice9* dev) {
  * Init Thread
  * ========================================================================== */
 static DWORD WINAPI InitThread(LPVOID) {
-    sdk::LogOpen("SpeedoIV-CE.log");
-    sdk::Log("SpeedoIV-CE v2.0 starting...");
+    /* LogOpen sets target filename, but defers the actual fopen.
+     * Debug flag isn't known yet -- we'll get it from Config.ini on first
+     * frame and either truncate (Debug=true) or stay in lazy mode. */
+    sdk::LogOpen("SpeedoIV-CE.log", /*debug=*/false);
+    sdk::Log("SpeedoIV-CE starting...");
 
-    Sleep(10000); /* Wait for game + DXVK init */
+    Sleep(10000);  /* wait for game + DXVK init */
 
     auto mod = sdk::GetGameModule();
-    if (!mod.valid) { sdk::Log("FATAL: game module not found"); return 0; }
+    if (!mod.valid) { sdk::LogError("Game module not found"); return 0; }
     sdk::Log("Game module: base=0x%08X size=0x%08X", (unsigned)mod.base, (unsigned)mod.size);
 
     for (int i = 0; i < 10; i++) {
@@ -390,11 +314,9 @@ static DWORD WINAPI InitThread(LPVOID) {
         if (d3d9hook::Install(mod.base, mod.size)) break;
         Sleep(3000);
     }
-
     return 0;
 }
 
-/* Called by hook when the device is being reset (e.g. alt+tab) */
 static void OnDeviceLost() {
     sdk::Log("Device reset detected - releasing resources");
     ReleaseResources();

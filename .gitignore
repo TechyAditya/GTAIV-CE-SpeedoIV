@@ -6,5 +6,6 @@
 *.log
 *.pdb
 build/
+dist/*.zip
 ENVIRONMENT.md
 deploy.ps1
