@@ -1,0 +1,272 @@
+# ISSUES.md
+
+Chronological log of issues encountered and their resolutions during
+SpeedoIV-CE development. Useful as a reference for what doesn't work
+and why, so we don't re-tread dead ends.
+
+---
+
+## 1. Original SpeedoIV (2009) incompatible with Complete Edition
+
+**Finding**: The bundled `SpeedoIV.asi` v0.3a (with the retarded_chicken
+skin pack) is hard-linked against `ScriptHook.dll` v0.5.1 (Aru's C++ hook,
+2009). That ScriptHook only supports GTA IV 1.0.4.0 - 1.0.7.0. The
+Complete Edition is 1.2.0.43. ScriptHook is therefore non-functional.
+
+**Fix**: Wrote a new standalone ASI plugin (SpeedoIV-CE) that does not
+depend on ScriptHook. Reads vehicle speed directly from game memory.
+
+**Files retained from upstream**:
+- `Bck.png`, `Bck_orig.png` -- dial face
+- `Pin.png`, `Pin_orig.png` -- needle
+- `Config.ini` -- positioning/sizing parameters
+
+---
+
+## 2. Polluted game folder
+
+**Finding**: User had extracted `Dependencies_x64_Release.zip` (a PE
+dependency viewer tool) directly into the game folder. This dumped 67
+unrelated files including 64-bit `MSVCP140.dll`, `ucrtbase.dll`,
+`VCRUNTIME140.dll` etc. -- all 64-bit DLLs in a 32-bit game folder,
+some of which would shadow/conflict with the legit DLLs the game needs.
+
+**Fix**: Removed all files matching the Dependencies zip contents.
+Verified against extracted archive list to ensure only foreign files
+were deleted (not game files).
+
+---
+
+## 3. MinGW 64-bit only, no 32-bit cross-compile
+
+**Finding**: Initial `winget install BrechtSanders.WinLibs.POSIX.UCRT`
+installed only x86_64 MinGW. GTA IV is 32-bit so we need i686 output.
+`g++ -m32` failed because the 32-bit runtime libraries weren't included.
+
+**Fix**: Downloaded WinLibs i686 (13.2.0 posix-dwarf-ucrt) from GitHub
+releases, extracted to a temp dir. Use that g++ explicitly.
+
+---
+
+## 4. MSVC SEH not supported by GCC
+
+**Finding**: First-pass code used `__try / __except(EXCEPTION_EXECUTE_HANDLER)`
+to safely probe potentially-invalid memory. GCC rejects this -- SEH
+intrinsics are MSVC-only.
+
+**Fix**: Replaced every `__try / __except` block with `IsBadReadPtr`
+guards before dereferencing. See `sdk::SafeReadPtr` / `sdk::SafeReadFloat`
+in `gtaiv_sdk.h`.
+
+---
+
+## 5. D3D9 dummy-device vtable hook does NOT work with DXVK
+
+**Finding**: The classic approach for an external D3D9 overlay --
+`Direct3DCreate9` -> `CreateDevice` on a hidden window -> patch
+`vtable[42]` of the resulting device -- did not affect the game's
+rendering. Hook installed, but `HookedEndScene` never fired.
+
+**Root cause**: FusionFix's `d3d9.dll` redirects to **DXVK** (`vulkan.dll`)
+which uses **per-instance vtables**. The vtable from the dummy device is
+NOT shared with the game's device.
+
+**Failed attempts**:
+- Vtable hook from dummy device -> no fire
+- Vtable hook from dummy device + Reset hook -> no fire
+- Scanning all memory for device-shaped objects with vtable in d3d9.dll
+  -> found objects with `vt[42] = 0` (some COM Vulkan helper, not a device)
+- Inline JMP detour on `vt[42]` function body resolved from dummy device
+  -> crash, because the function had a stack-aligning prologue
+  (`8D 4C 24 04 83 E4 ??`) that broke when relocated.
+
+**Fix**: See issue #6.
+
+---
+
+## 6. RAGE engine wraps the D3D9 device
+
+**Finding**: While reading FusionFix source, learned that the game
+(RAGE engine) creates its own `IDirect3DDevice9` subclass with the
+vtable embedded inside `GTAIV.exe` itself. The game stores the wrapper
+in a global pointer and pattern-scannable via:
+
+```
+A1 ?? ?? ?? ?? 50 8B 08 FF 51 ??
+mov eax, [g_pDevice]
+push eax
+mov ecx, [eax]      ; vtable
+call [ecx+0xNN]     ; vtable[NN]
+```
+
+The right device's vtable lives in `GTAIV.exe` (not in `d3d9.dll`).
+Once we patch THAT vtable's `[42]`, the hook fires every frame.
+
+Confirmed by `inject_hook.exe`: patched `vt[42]` from outside the
+process, counter ticked at ~88 Hz = game's framerate.
+
+**Fix**: `d3d9hook::Install()` now scans the game for the wrapper-device
+pointer and patches its in-game vtable directly. No dummy device.
+
+---
+
+## 7. Black/dark sprite rendering
+
+**Finding**: After EndScene hook fired correctly, our D3DX sprite rendered
+as a black silhouette instead of the colorful PNG texture.
+
+**Root cause**: GTA IV finishes its rendering pass with a tonemap /
+HDR-style pixel shader still bound. Our sprite was being processed
+through that shader, producing dark output.
+
+**Fix**: Before calling `g_sprite->Begin`, reset device state explicitly:
+
+```cpp
+dev->SetPixelShader(NULL);
+dev->SetVertexShader(NULL);
+dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+// ... etc
+```
+
+After this, colors render correctly.
+
+---
+
+## 8. Alt+tab crash
+
+**Finding**: Alt-tabbing out of the game caused immediate process crash.
+
+**Root cause**: DXVK doesn't reliably return `D3DERR_DEVICELOST` from
+`TestCooperativeLevel`. When the device is recreated (alt+tab in
+fullscreen-borderless mode that DXVK uses), our cached `ID3DXSprite`,
+`IDirect3DTexture9*` and `ID3DXFont` reference the OLD device. Drawing
+with them crashes.
+
+**Fix**:
+- Also hook the wrapper's `vtable[16]` (Reset). When the game calls
+  Reset (which DXVK does on focus changes), our pre-hook callback fires
+  and releases all D3D resources.
+- The next EndScene re-acquires them against the new device.
+- See `d3d9hook::SetLostCallback` + `speedometer::OnDeviceLost`.
+
+---
+
+## 9. CPedFactory pattern scan picked wrong factory
+
+**Finding**: Several memory pointers look like a valid CPedFactory
+(vtable + ped pointer + vehicle pointer), but most are stale or
+dummy objects. The first match we accepted always reported speed
+near zero, no matter how fast you were actually driving.
+
+**Investigation tools**:
+- `debug_scan.exe` -- iterates pattern hits, dereferences each
+  candidate, tries every plausible vehicle/velocity offset, prints
+  the resulting "speed in km/h"
+- `find_real.exe` -- locates the specific candidate at the verified
+  byte offset that gives a realistic moving-speed reading
+
+**Findings**:
+- Real CPedFactory global: `0x01D3A46C` (in the game's data section)
+- vehicle pointer offset on CPed: `0x32C` (CE-specific)
+- velocity vector offset on CVehicle: `0x80` (CE-specific, not `0x70`
+  which is the legacy offset)
+- Wrong candidates were earlier in the scan order, so they won.
+
+**Fix**:
+1. Increased pattern scan limit from 200 to 10000 hits.
+2. Implemented **scored factory selection**: every candidate that
+   passes basic validation is given a score (= highest reported
+   speed across all velocity-offset tries). We pick the candidate
+   with the highest score after scanning ALL hits.
+3. Periodic re-scan if speed stays under 1 km/h for ~10 seconds
+   despite player being in vehicle.
+
+**Caveat**: For the scored scan to work, the player needs to be
+**driving** at the moment Init runs. Spawning stationary will lock
+onto a wrong factory until the re-scan triggers.
+
+---
+
+## 10. F5 hijacked as quicksave
+
+**Finding**: Using `VK_F5` (`116`) as the speedometer toggle caused
+GTA IV to also trigger its built-in F5 action (quicksave/screenshot).
+The toggle "didn't work" because the game's F5 binding interfered.
+
+**Fix**: Changed default `ToggleKey` to F6 (`117`). Documented
+alternative keys in `Config.ini` comment.
+
+---
+
+## 11. Config live-reload clobbered toggle state
+
+**Finding**: After fixing the toggle key, pressing F6 logged
+`Toggle: visible=0` then `Toggle: visible=1` rapidly because
+`LoadConfig` runs every ~1 second and was setting
+`g_visible = g_cfg.autostart`, undoing the user's toggle.
+
+**Fix**: Only initialize `g_visible` on the first config load. On
+subsequent reloads, keep the user's current visibility state.
+
+---
+
+## 12. Position math broke after refactor
+
+**Finding**: After changing the D3DX sprite center to texture-pixel
+coords for needle rotation, the dial appeared in the wrong place
+(off-screen / very small).
+
+**Root cause**: `D3DXMatrixTransformation2D` uses texture-pixel coords
+for both scaling-center and rotation-center anchors. Mixing screen
+coords for one and texture coords for the other broke the position.
+
+**Fix**: Use `(0, 0)` for scaling center (scale anchored at sprite
+origin) and `(texSize/2, texSize/2)` for rotation center (needle pivots
+on dial center). Translation `pos` is in screen pixels and adds AFTER
+scaling, so the final position math is straightforward.
+
+---
+
+## 13. Needle rotation direction / origin
+
+**Finding**: After fixing position, the needle texture either didn't
+move or rotated from the wrong start point.
+
+**Root cause**: The retarded_chicken skin's `Pin.png` already shows
+the needle in the "0" position (bottom-left of dial). The needle
+needs to rotate clockwise from this position by `(speed / maxSpeed) *
+270 degrees`, NOT from straight-up.
+
+**Fix**: Changed needle angle formula to `ratio * 270.f` (no -135
+offset).
+
+---
+
+## 14. Pin.png was a black silhouette in the new skin
+
+(Resolved by issue #7.) When colors first started rendering, the
+needle was visible as a colored bar -- previously it appeared as a
+random horizontal line because the texture pixels weren't being
+properly modulated through D3D state.
+
+---
+
+## 15. Iteration speed -- locked ASI file during development
+
+**Finding**: While the game is running, the loaded ASI file is
+locked by the process. Copy-replacing it fails. Original workflow
+required closing the game manually between every code change.
+
+**Fix**: `deploy.ps1` automates: kill process -> wait -> copy ASI ->
+launch. One command, full iteration.
+
+**Live-tunable params**: For visual tweaks (position, size, alpha,
+colors), `Config.ini` is re-read every ~1 second. No restart needed.
