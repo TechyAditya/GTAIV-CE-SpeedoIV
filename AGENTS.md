@@ -42,12 +42,16 @@ append-only documentation of what was tried, what worked, and why.
 
 | File | Purpose |
 |---|---|
-| `README.md`     | For humans: install, configure, credits, layout |
-| `AGENTS.md`     | (this file) Conventions, deployment, hook architecture |
-| `SETUP.md`      | Bootstrap (`setup.ps1`) details + manual fallback |
-| `ENVIRONMENT.md`| Local paths + observed memory layout (gitignored; agent-maintained) |
-| `FusionFix.md`  | How FusionFix works and how our patterns relate |
-| `ISSUES.md`     | Chronological history of bugs + how they were diagnosed |
+| `README.md`               | For humans: install, configure, credits, layout |
+| `AGENTS.md`               | (this file) Conventions, deployment, hook architecture, release flow |
+| `SETUP.md`                | Bootstrap (`setup.ps1`) details + manual fallback |
+| `ENVIRONMENT.md`          | Local paths + observed memory layout (gitignored; agent-maintained) |
+| `FusionFix.md`            | How FusionFix works and how our patterns relate |
+| `ISSUES.md`               | Chronological history of bugs + how they were diagnosed |
+| `RELEASE_NOTES.md`        | Body of the **next** GitHub release. Rewritten each version. |
+| `RELEASE_NOTES.md.template` | Skeleton for writing `RELEASE_NOTES.md` for a new version |
+| `VERSION`                 | Single line semver string driving releases |
+| `LICENSE`                 | GPL-3.0 verbatim |
 
 If `ENVIRONMENT.md` is missing, run `.\setup.ps1` (idempotent; safe to
 re-run). After the first run it becomes agent/human-maintained and
@@ -79,20 +83,30 @@ tools/              Dev-only utilities. `.\build.ps1 -Tools` builds them.
     device_scan.cpp     Enumerate D3D9 device candidates
     restore_hook.cpp    Restore a manually-patched vtable entry
 
-SpeedoIV/           Asset folder shipped into the game directory.
-    Config.ini
-    Default/
-        Bck.png       Dial face (retarded_chicken artwork, 2009)
-        Pin.png       Needle (points at the 0 mark)
-        NOTICE.txt    Credits for the bundled artwork
+dist/               Release staging area
+    SpeedoIV/         Canonical end-user config + skin shipped in releases
+        Config.ini      Default settings
+        Default/
+            Bck.png       Dial face (retarded_chicken artwork, 2009)
+            Pin.png       Needle (points at the 0 mark)
+            NOTICE.txt    Credits for the bundled artwork
+    *.zip             Built by publish.ps1, gitignored
 
-speedometer.cpp     The ASI itself -- thin glue over the sdk/ modules
-build.ps1           Build SpeedoIV-CE.asi (and optionally tools/)
-setup.ps1           One-time MinGW + ENVIRONMENT.md + deploy.ps1 bootstrap
+.github/workflows/
+    release.yml       Tag-triggered CI: validate, build, publish GitHub Release
 
-build/              Compiled artifacts (gitignored)
-ENVIRONMENT.md      Per-clone paths + memory layout (gitignored)
-deploy.ps1          Per-developer deploy wrapper (gitignored)
+speedometer.cpp       The ASI itself -- thin glue over the sdk/ modules
+build.ps1             Build SpeedoIV-CE.asi (and optionally tools/)
+setup.ps1             One-time MinGW + ENVIRONMENT.md + deploy.ps1 bootstrap
+publish.ps1           Package a release zip locally (also used by CI)
+
+VERSION               Single-line semver release version
+RELEASE_NOTES.md      Notes body for the next release (required by CI)
+LICENSE               GPL-3.0
+
+build/                Compiled artifacts (gitignored)
+ENVIRONMENT.md        Per-clone paths + memory layout (gitignored)
+deploy.ps1            Per-developer deploy wrapper (gitignored)
 ```
 
 ## Deployment Flow
@@ -288,52 +302,116 @@ Final ASI is ~70-75 KB.
 ## Versioning + Releases
 
 The release version lives in **`VERSION`** at the repo root -- a single
-line, semver style (e.g. `1.0.0`). `publish.ps1` reads it and uses it
-for the output zip name (`SpeedoIV-CE-v<VERSION>.zip`) and for the
-embedded README inside the zip.
+line, semver style (e.g. `1.0.0`). It is the single source of truth
+for the released version number; `publish.ps1`, the bundled
+`README.txt`, and the GitHub Actions release workflow all derive
+from it.
 
-**Bumping the version**:
+### Release flow (compulsory steps)
 
-1. Edit `VERSION` -- one line, no leading `v`, no trailing whitespace.
-2. Update `ISSUES.md` and any user-facing docs that mention version
-   numbers.
-3. Commit the `VERSION` bump + changes together.
-4. Run `.\publish.ps1` to produce `dist\SpeedoIV-CE-v<NEW>.zip`.
-5. Optionally tag the release: `git tag v<NEW> && git push --tags`.
+Releases are produced by the **GitHub Actions workflow**
+`.github/workflows/release.yml`. It triggers on a pushed semver tag
+(`v*.*.*`) and refuses to publish unless every step below is in place.
 
-**Rules for the version number**:
+1. **Edit `VERSION`** -- one line, no leading `v`, no trailing
+   whitespace. Follow the bump policy:
+   - **Patch** (`1.0.0 -> 1.0.1`): bug fixes, doc-only changes,
+     internal refactors that don't change behaviour.
+   - **Minor** (`1.0.0 -> 1.1.0`): new user-visible features
+     (additional config knobs, new commands, additional SDK modules)
+     that remain backward-compatible.
+   - **Major** (`1.0.0 -> 2.0.0`): breaking changes -- removed
+     config keys, renamed config keys without migration, renamed SDK
+     headers, game-version compatibility breaks.
 
-- **Patch bump** (`1.0.0 -> 1.0.1`): bug fixes, doc-only changes, internal
-  refactors that don't change behavior.
-- **Minor bump** (`1.0.0 -> 1.1.0`): new user-visible features
-  (additional config knobs, new commands, additional SDK modules) that
-  remain backward-compatible.
-- **Major bump** (`1.0.0 -> 2.0.0`): breaking changes -- removed config
-  keys, renamed config keys without migration, renamed SDK headers,
-  game-version compatibility breaks.
+2. **Rewrite `RELEASE_NOTES.md`** for this version. The file becomes
+   the GitHub Release body verbatim. Use `RELEASE_NOTES.md.template`
+   as the structure. Write it for end users -- engineering detail
+   belongs in `ISSUES.md` and commit messages, not in the release
+   notes. The workflow rejects empty / short notes (<64 bytes).
 
-**What is NOT a release**:
+3. **Update `ISSUES.md`** with any new findings, fixes, or design
+   changes covered by this release. Append a numbered section --
+   never rewrite history.
 
-- Editing `VERSION` does not automatically build / publish anything.
-  `publish.ps1` is explicit -- run it when you're ready.
-- Local `.asi` builds in `build/` and uploads to the game's plugins
-  folder via `deploy.ps1` are dev-time only; they do not bump
-  `VERSION` and do not touch `dist/`.
+4. **Update `dist/SpeedoIV/Config.ini`** if any new config keys were
+   added to `speedometer.cpp`, so upgraders see the new options.
 
-**Files synchronized with `VERSION`**:
+5. **Commit all of the above together**:
 
-- `publish.ps1` -- reads `VERSION` to name the zip and embed the
-  number into the in-zip README.
-- `dist/SpeedoIV/Config.ini` -- the canonical end-user config shipped
-  in the zip. Edit this file rather than the per-user
-  `<game>\SpeedoIV\Config.ini` when you want a change to ship.
-- `dist/SpeedoIV/Default/` -- end-user-facing artwork + NOTICE shipped
-  in the zip. The per-user copy in `<game>\SpeedoIV\Default\` is a
-  developer artifact and may diverge.
+   ```
+   git add VERSION RELEASE_NOTES.md ISSUES.md dist/SpeedoIV/Config.ini ...
+   git commit -m "Release vX.Y.Z: <one-line summary>"
+   git push
+   ```
 
-If you add a new config key to `speedometer.cpp`, also add it to
-`dist/SpeedoIV/Config.ini` so end-users see the new option after
-upgrading.
+6. **Tag and push**. The tag MUST be `v` + the contents of `VERSION`
+   verbatim, or the workflow will fail the validate step:
+
+   ```
+   git tag "v$(Get-Content VERSION -Raw | ForEach-Object Trim)"
+   git push origin --tags
+   ```
+
+7. **Watch the Actions tab**. The workflow:
+   - Validates `tag == "v<VERSION>"`.
+   - Validates `RELEASE_NOTES.md` exists and is non-trivial.
+   - Installs MinGW 13.2.0 i686 (cached between runs).
+   - Runs `build.ps1 -NoInstall`, then `publish.ps1 -SkipBuild`.
+   - Uploads the zip as a workflow artifact.
+   - Creates (or replaces) the GitHub Release at
+     `/releases/tag/v<VERSION>` with `RELEASE_NOTES.md` as the body
+     and the zip attached.
+
+   The release appears at:
+   `https://github.com/<owner>/<repo>/releases/tag/v<VERSION>`
+
+### Local-only "publish"
+
+If you want a local `dist\SpeedoIV-CE-v<VERSION>.zip` without
+involving GitHub:
+
+```
+.\publish.ps1
+```
+
+Same script the Actions runner uses; same output. The zip stays on
+your machine. Don't commit it -- `.gitignore` excludes `dist/*.zip`.
+
+### What is NOT a release
+
+- Editing `VERSION` does not by itself publish anything. The tag push
+  is the trigger.
+- Local `.asi` builds in `build/` and the per-user
+  `<game>\plugins\SpeedoIV-CE.asi` installed by `deploy.ps1` are
+  dev-time artefacts. They do not bump `VERSION` and do not touch
+  `dist/`.
+- Pushing to `master` without a tag never publishes a release.
+
+### Files that ARE shipped artifacts
+
+These are checked in and act as the canonical source for what users
+receive:
+
+- `VERSION` -- the version string.
+- `RELEASE_NOTES.md` -- the release body for the **next** release.
+- `dist/SpeedoIV/Config.ini` -- end-user defaults.
+- `dist/SpeedoIV/Default/` -- end-user dial / needle / NOTICE.
+- `LICENSE` -- GPL-3.0.
+- All of `sdk/`, `tools/`, `speedometer.cpp`, `*.ps1`, `*.md` --
+  the source the workflow rebuilds from.
+
+### Re-running a release
+
+If a release tag is already published and you need to rebuild it
+(e.g. workflow was broken the first time):
+
+1. Delete the release in the Actions UI or via
+   `gh release delete v<X.Y.Z> --yes`.
+2. Delete the tag locally and remotely:
+   `git tag -d v<X.Y.Z>; git push origin :refs/tags/v<X.Y.Z>`.
+3. Fix the issue. Re-tag. Re-push. The workflow auto-replaces the
+   release if one already exists for the same tag.
 
 ## Git Hygiene
 

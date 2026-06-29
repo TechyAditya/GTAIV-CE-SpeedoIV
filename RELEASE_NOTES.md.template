@@ -1,0 +1,45 @@
+# Release notes template
+
+Copy this file to ``RELEASE_NOTES.md`` and fill in the sections that
+apply, then commit it together with the ``VERSION`` bump.
+
+The GitHub Actions release workflow (``.github/workflows/release.yml``)
+refuses to publish a release if ``RELEASE_NOTES.md`` is missing or
+smaller than 64 bytes, so don't leave it empty.
+
+The file contents become the GitHub Release body verbatim -- write it
+for end users, not for fellow developers. Engineering changelog
+detail belongs in ``ISSUES.md`` (institutional memory) and the git
+log (commit messages).
+
+---
+
+## Highlights
+
+- One bullet per user-visible change.
+
+## Install
+
+Same as the previous release -- extract the zip into your GTA IV
+install folder. See the bundled ``README.txt`` for the full
+walkthrough.
+
+## Requirements
+
+- GTA IV: The Complete Edition v1.2.0.43 (Rockstar Launcher or Steam)
+- Ultimate ASI Loader (``dinput8.dll``)
+- FusionFix 5.x recommended
+
+## Breaking changes
+
+(Only present in major-version bumps. List every removed / renamed
+config key and how to migrate.)
+
+## Fixes
+
+- One bullet per visible bug fix.
+
+## Internal
+
+(Optional, short. For substantial refactors that don't affect users
+but you want acknowledged in the public notes.)

@@ -465,3 +465,64 @@ ENVIRONMENT.md and deploy.ps1 from a SETUP.md template.
   line continuations choke when there's trailing whitespace or a
   comma immediately before a newline -- the parser produces
   `Missing argument in parameter list` with no useful line number.
+
+---
+
+## 22. CI-driven release pipeline
+
+**Finding**: `publish.ps1` produced a perfectly good zip locally,
+but every release required hand-running it on a developer machine,
+manually copying the zip to a GitHub Release, and writing the body
+in the GitHub UI. Easy to forget a step (e.g. uploading the wrong
+zip after a partial rebuild) and impossible to reproduce a release
+from a fresh checkout months later.
+
+**Fix**: Added a tag-triggered GitHub Actions workflow
+(`.github/workflows/release.yml`) that:
+
+1. Triggers on any pushed tag matching `v[0-9]+.[0-9]+.[0-9]+`
+   (with optional `-suffix` for pre-releases).
+2. Validates `tag == "v" + VERSION` so a wrong-name tag fails fast.
+3. Refuses to publish if `RELEASE_NOTES.md` is missing or shorter
+   than 64 bytes. This forces an explicit, human-written note per
+   release; auto-generated changelogs go in `ISSUES.md` and the
+   git log, not in the GitHub Release body.
+4. Caches and downloads the same MinGW 13.2.0 i686 build we use
+   locally, so CI artefacts are byte-compatible with local builds.
+5. Runs `build.ps1 -NoInstall` (the `-NoInstall` switch was added
+   in the previous refactor specifically to stop `build.ps1` trying
+   to copy to a non-existent `plugins\` folder during CI), then
+   `publish.ps1 -SkipBuild` to package the zip.
+6. Uploads the zip as a workflow artefact (kept for 90 days) and
+   also attaches it to the GitHub Release.
+7. If a release for the same tag already exists (e.g. re-running
+   after fixing the workflow), deletes the existing release first
+   so the new one replaces it cleanly.
+
+**New required files**:
+
+- `VERSION` (already existed) is now load-bearing for CI -- a
+  mismatched tag fails the workflow.
+- `RELEASE_NOTES.md` (new) is read verbatim as the GitHub Release
+  body. Must exist and be non-trivial.
+- `RELEASE_NOTES.md.template` (new) is the canonical skeleton --
+  bumpers copy it to `RELEASE_NOTES.md` and fill in per-version.
+- `LICENSE` (new) -- GPL-3.0 verbatim, fetched from the canonical
+  FSF text via the FusionFix repo. GitHub auto-detected the license
+  on the repo page after push.
+
+**Lessons**:
+
+- Tag-push triggers are the right primitive: the tag is the
+  declarative statement "this commit is release v1.0.1", and the
+  workflow does the rest. Manual `workflow_dispatch` triggers
+  are too easy to mis-fire from the wrong branch.
+- Forcing a non-trivial `RELEASE_NOTES.md` catches the "v1.0.1 was
+  just a one-line internal change" trap -- if the change is too
+  small to describe in 64 bytes of release notes, it probably
+  doesn't deserve a tag.
+- Caching the MinGW toolchain keeps CI runs at ~2 minutes after
+  the first run (a fresh download is ~5 minutes).
+- `gh release create --verify-tag` ensures the workflow can't
+  accidentally publish a release for a tag that wasn't actually
+  pushed.

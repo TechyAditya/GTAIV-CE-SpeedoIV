@@ -52,7 +52,27 @@ After setup completes:
 .\deploy.ps1                # full build + kill + redeploy + relaunch cycle
 .\build.ps1 -Tools          # also build everything in tools\ to build\*.exe
 .\build.ps1 -ToolsOnly      # skip ASI, just rebuild tools
+.\publish.ps1               # build + package dist\SpeedoIV-CE-v<VERSION>.zip locally
 ```
+
+## Cutting a release
+
+Releases are produced by GitHub Actions
+(`.github/workflows/release.yml`) on every pushed semver tag. The
+required steps are documented in **AGENTS.md "Versioning + Releases"**
+and summarised here:
+
+1. Edit `VERSION` (e.g. `1.0.0` -> `1.0.1`).
+2. Rewrite `RELEASE_NOTES.md` for end users (template:
+   `RELEASE_NOTES.md.template`). CI will reject empty / short notes.
+3. Append to `ISSUES.md` if anything noteworthy was learned.
+4. If new config keys were added to `speedometer.cpp`, update
+   `dist/SpeedoIV/Config.ini` to match.
+5. Commit and push.
+6. `git tag v<VERSION>` and `git push origin --tags`.
+7. The workflow validates the tag, builds the ASI in CI, packages
+   the zip, and creates the GitHub Release with `RELEASE_NOTES.md`
+   as the body.
 
 ## Manual fallback (no setup.ps1)
 

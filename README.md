@@ -69,22 +69,39 @@ optional.
 
 ## Releases
 
-The release version lives in **`VERSION`** at the repo root (semver,
-single line, no `v` prefix). To cut a release:
+Released via [GitHub Actions](.github/workflows/release.yml) on every
+pushed semver tag. Latest version is in
+[**VERSION**](VERSION); release zips appear at
+[**Releases**](../../releases).
+
+To cut a release:
 
 ```powershell
-# Edit VERSION (e.g. 1.0.0 -> 1.0.1), commit it together with the changes.
-.\publish.ps1
-# -> dist\SpeedoIV-CE-v1.0.1.zip
+# 1. Edit VERSION (e.g. 1.0.0 -> 1.0.1)
+# 2. Rewrite RELEASE_NOTES.md for end users (template in RELEASE_NOTES.md.template)
+# 3. Append a section to ISSUES.md if there's anything worth recording
+# 4. Update dist/SpeedoIV/Config.ini if you added new config keys
+git commit -am "Release v1.0.1: ..."
+git push
+git tag v1.0.1
+git push origin --tags
+# The Release workflow takes it from here -- watch the Actions tab.
 ```
 
-The zip layout matches the GTA IV install folder, so end users just
-extract it on top of their game directory. The shipped end-user
-README lives at the zip root and is auto-generated from the version,
-build date, and current git commit short SHA.
+The workflow validates that the tag matches `VERSION`, requires a
+non-trivial `RELEASE_NOTES.md`, builds the ASI in CI using the same
+MinGW toolchain we use locally, runs `publish.ps1`, and creates the
+release with the zip attached and your notes as the body.
 
-See `AGENTS.md` "Versioning + Releases" for the bump policy
-(patch / minor / major).
+To build the zip locally (without pushing):
+
+```powershell
+.\publish.ps1
+# -> dist\SpeedoIV-CE-v<VERSION>.zip
+```
+
+See [AGENTS.md](AGENTS.md) "Versioning + Releases" for the bump
+policy (patch / minor / major) and the full required-steps checklist.
 
 ## Code layout
 
@@ -129,6 +146,10 @@ build.ps1            build the ASI and (optionally) tools/
 setup.ps1            one-time MinGW + ENVIRONMENT.md + deploy.ps1 bootstrap
 publish.ps1          package a release zip (reads VERSION)
 VERSION              release version (semver, single line)
+RELEASE_NOTES.md     body of the next GitHub release (required by CI)
+LICENSE              GPL-3.0
+.github/workflows/
+    release.yml      tag-triggered CI: builds + publishes a GitHub release
 
 README.md            this file
 AGENTS.md            conventions + working-with-codebase guide

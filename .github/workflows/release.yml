@@ -1,0 +1,138 @@
+name: Release
+
+# Triggered by pushing a semver tag like v1.0.0 or v1.2.3.
+# Builds the ASI from source, packages dist\SpeedoIV-CE-v<X.Y.Z>.zip via
+# publish.ps1, then creates / updates a GitHub Release using the body
+# from RELEASE_NOTES.md.
+#
+# Required repo state before tagging:
+#   - VERSION file contains the same number (no leading 'v')
+#   - RELEASE_NOTES.md exists and contains the human-written notes
+#
+# Bumping a release:
+#   1. Edit VERSION and RELEASE_NOTES.md, commit + push.
+#   2. git tag v$(cat VERSION) && git push origin v$(cat VERSION)
+#   3. Watch Actions tab; release appears at /releases/tag/v<X.Y.Z>.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Token needs write access to publish a release
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we want tags + history for note generation
+
+      - name: Validate tag matches VERSION
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = (Get-Content VERSION -Raw).Trim()
+          $expected = "v$version"
+          if ($tag -ne $expected) {
+            Write-Host "Tag '$tag' does not match VERSION file '$version' (expected '$expected')"
+            Write-Host "Bump VERSION to match the tag, or push a different tag."
+            exit 1
+          }
+          Write-Host "OK: tag $tag == v$version"
+
+      - name: Require RELEASE_NOTES.md
+        shell: pwsh
+        run: |
+          if (-not (Test-Path RELEASE_NOTES.md)) {
+            Write-Host "RELEASE_NOTES.md is missing -- refusing to release without notes."
+            Write-Host "Create it before tagging (see RELEASE_NOTES.md.template)."
+            exit 1
+          }
+          $size = (Get-Item RELEASE_NOTES.md).Length
+          if ($size -lt 64) {
+            Write-Host "RELEASE_NOTES.md looks empty (size=$size bytes). Write the notes."
+            exit 1
+          }
+          Write-Host "OK: RELEASE_NOTES.md present ($size bytes)"
+
+      - name: Cache MinGW toolchain
+        id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          path: C:\mingw32
+          key: mingw-i686-13.2.0-posix-dwarf-ucrt-rt_v11-rev1
+
+      - name: Install MinGW i686 13.2.0
+        if: steps.cache-mingw.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/niXman/mingw-builds-binaries/releases/download/13.2.0-rt_v11-rev1/i686-13.2.0-release-posix-dwarf-ucrt-rt_v11-rev1.7z"
+          $arc = "$env:RUNNER_TEMP\mingw32.7z"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $arc -UseBasicParsing
+          Write-Host "Extracting..."
+          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+          & $sevenZip x $arc "-oC:\mingw32" -y | Out-Null
+          Write-Host "Installed:"
+          & "C:\mingw32\mingw32\bin\g++.exe" --version | Select-Object -First 1
+
+      - name: Build ASI
+        shell: pwsh
+        run: |
+          .\build.ps1 -GCC "C:\mingw32\mingw32\bin\g++.exe" -NoInstall
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $asi = "build\SpeedoIV-CE.asi"
+          if (-not (Test-Path $asi)) { Write-Error "Build artifact missing"; exit 1 }
+          $kb = [math]::Round((Get-Item $asi).Length / 1KB, 1)
+          Write-Host "Built: $asi ($kb KB)"
+
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          .\publish.ps1 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $version = (Get-Content VERSION -Raw).Trim()
+          $zip = "dist\SpeedoIV-CE-v$version.zip"
+          if (-not (Test-Path $zip)) { Write-Error "Zip missing: $zip"; exit 1 }
+          $kb = [math]::Round((Get-Item $zip).Length / 1KB, 1)
+          Write-Host "Packaged: $zip ($kb KB)"
+
+      - name: Upload zip as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeedoIV-CE-${{ github.ref_name }}
+          path: dist\SpeedoIV-CE-v*.zip
+          if-no-files-found: error
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $tag     = "v$version"
+          $zip     = "dist\SpeedoIV-CE-v$version.zip"
+          $title   = "SpeedoIV-CE $tag"
+
+          # If a release for this tag already exists, replace it
+          $existing = gh release view $tag --json id 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing release for $tag found, deleting before re-creating"
+            gh release delete $tag --yes
+          }
+
+          gh release create $tag $zip `
+            --title $title `
+            --notes-file RELEASE_NOTES.md `
+            --verify-tag
+
+          Write-Host ""
+          Write-Host "Released: https://github.com/${{ github.repository }}/releases/tag/$tag"
