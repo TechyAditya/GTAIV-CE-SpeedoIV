@@ -151,7 +151,9 @@ namespace player {
     static const int NUM_VEH = sizeof(VEH_OFFSETS) / sizeof(int);
     static const int NUM_VEL = sizeof(VEL_OFFSETS) / sizeof(int);
 
-    /* Validate a candidate CPedFactory global address */
+    /* Validate a candidate CPedFactory global address.
+     * We REQUIRE a non-zero velocity reading to accept it -- this filters out
+     * stale/dummy ped pointers that happen to look valid. */
     inline bool TryFactory(uintptr_t ptrAddr) {
         if (!IsValidPtr(ptrAddr)) return false;
         uintptr_t fp = 0;
@@ -163,25 +165,26 @@ namespace player {
         uintptr_t pedVt = 0;
         if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
 
+        /* Try each veh offset; require valid vehicle with sensible velocity at SOME offset */
         for (int v = 0; v < NUM_VEH; v++) {
             uintptr_t veh = 0;
             if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
-            if (veh == 0) { /* on foot -- accept */
-                g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
-                g_velOffset = 0x70; g_ready = true; return true;
-            }
+            if (veh == 0) continue; /* on foot - skip, look for in-vehicle match */
             if (!IsHeapPtr(veh)) continue;
             uintptr_t vehVt = 0;
             if (!ReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
-            /* Validate velocity */
+
+            /* Validate velocity at each candidate offset */
             for (int vi = 0; vi < NUM_VEL; vi++) {
                 float vx, vy, vz;
                 uintptr_t vb = veh + VEL_OFFSETS[vi];
                 if (ReadFloat(vb, &vx) && ReadFloat(vb+4, &vy) && ReadFloat(vb+8, &vz)) {
                     float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
-                    if (s >= 0.0f && s <= 500.0f) {
+                    /* Accept ANY reasonable speed (including 0 if all 3 floats are exactly 0) */
+                    if (s >= 0.0f && s <= 500.0f && (vx != 0.0f || vy != 0.0f || vz != 0.0f)) {
                         g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
-                        g_velOffset = VEL_OFFSETS[vi]; g_ready = true; return true;
+                        g_velOffset = VEL_OFFSETS[vi]; g_ready = true;
+                        return true;
                     }
                 }
             }
@@ -189,24 +192,65 @@ namespace player {
         return false;
     }
 
-    /* Scan game memory for CPedFactory. Call after game is loaded. */
+    /* Same but also accepts on-foot state if no in-vehicle match is found.
+     * Use as a fallback after the strict TryFactory fails. */
+    inline bool TryFactoryFallback(uintptr_t ptrAddr) {
+        if (!IsValidPtr(ptrAddr)) return false;
+        uintptr_t fp = 0;
+        if (!ReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return false;
+        uintptr_t vt = 0;
+        if (!ReadPtr(fp, &vt) || !IsValidPtr(vt)) return false;
+        uintptr_t ped = 0;
+        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return false;
+        uintptr_t pedVt = 0;
+        if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
+        for (int v = 0; v < NUM_VEH; v++) {
+            uintptr_t veh = 0;
+            if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
+            if (veh == 0) {
+                g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
+                g_velOffset = 0x80; g_ready = true; return true;
+            }
+        }
+        return false;
+    }
+
+    /* Scan game memory for CPedFactory. Call after game is loaded.
+     * Two-pass: first prefer factories with active vehicle+velocity, 
+     * then fall back to on-foot detection. */
     inline bool Init(uintptr_t gameBase, size_t gameSize) {
         if (g_ready) return true;
 
-        struct { BYTE pat[9]; char mask[10]; int addrOff; } patterns[] = {
+        struct PatInfo { BYTE pat[9]; char mask[10]; int addrOff; };
+        PatInfo patterns[] = {
             { {0xA1,0,0,0,0,0x85,0xC0,0x74,0}, "x????xxx", 1 },
             { {0x8B,0x0D,0,0,0,0,0x8B,0x41,0x04}, "xx????xxx", 2 },
             { {0x8B,0x35,0,0,0,0,0x85,0xF6,0x74}, "xx????xxx", 2 },
         };
 
+        /* Pass 1: strict - require non-zero velocity (proves player is driving) */
         for (auto& p : patterns) {
             uintptr_t cur = gameBase;
             size_t rem = gameSize;
-            for (int n = 0; n < 100 && cur < gameBase + gameSize - 9; n++) {
+            for (int n = 0; n < 200 && cur < gameBase + gameSize - 9; n++) {
                 uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
                 if (!hit) break;
                 uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
                 if (TryFactory(candidate)) return true;
+                cur = hit + 1;
+                rem = gameBase + gameSize - cur;
+            }
+        }
+
+        /* Pass 2: fallback - accept on-foot state */
+        for (auto& p : patterns) {
+            uintptr_t cur = gameBase;
+            size_t rem = gameSize;
+            for (int n = 0; n < 200 && cur < gameBase + gameSize - 9; n++) {
+                uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
+                if (!hit) break;
+                uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
+                if (TryFactoryFallback(candidate)) return true;
                 cur = hit + 1;
                 rem = gameBase + gameSize - cur;
             }

@@ -216,16 +216,44 @@ static void OnFrame(IDirect3DDevice9* dev) {
         if (mod.valid) sdk::player::Init(mod.base, mod.size);
         LoadConfig();
         g_gameInit = true;
-        sdk::Log("Game init: offsets %s (factory=0x%08X)",
+        sdk::Log("Game init: offsets %s (factory=0x%08X vehOff=0x%X velOff=0x%X)",
                  sdk::player::g_ready ? "OK" : "FAILED",
-                 (unsigned)sdk::player::g_pedFactory);
+                 (unsigned)sdk::player::g_pedFactory,
+                 sdk::player::g_vehOffset, sdk::player::g_velOffset);
+    }
+
+    /* Re-scan periodically if we don't have a vehicle reading yet -- 
+     * the player might not have been in a car when we first scanned. */
+    static int rescanFrame = 0;
+    if (sdk::player::g_ready && ++rescanFrame % 600 == 0) {
+        /* Try if current pointer still gives valid speed; if not, re-scan */
+        float s = sdk::player::GetSpeed();
+        if (s < 0.0f) {
+            /* Reset and re-scan */
+            sdk::player::g_ready = false;
+            auto mod = sdk::GetGameModule();
+            if (mod.valid) sdk::player::Init(mod.base, mod.size);
+            sdk::Log("Re-scan: ready=%d factory=0x%08X vehOff=0x%X velOff=0x%X",
+                     sdk::player::g_ready, (unsigned)sdk::player::g_pedFactory,
+                     sdk::player::g_vehOffset, sdk::player::g_velOffset);
+        }
     }
 
     /* Toggle key */
     static bool keyPrev = false;
     bool keyNow = (GetAsyncKeyState(g_cfg.toggleKey) & 0x8000) != 0;
-    if (keyNow && !keyPrev) g_visible = !g_visible;
+    if (keyNow && !keyPrev) {
+        g_visible = !g_visible;
+        sdk::Log("Toggle: visible=%d", g_visible);
+    }
     keyPrev = keyNow;
+
+    /* Periodic status log */
+    static int frame = 0;
+    if (++frame % 300 == 1) {
+        float spd = sdk::player::g_ready ? sdk::player::GetSpeed() : -99.0f;
+        sdk::Log("Frame %d: visible=%d speed=%.1f resOk=%d", frame, g_visible, spd, g_resOk);
+    }
 
     /* Render if visible and in vehicle */
     if (g_visible && sdk::player::g_ready) {
