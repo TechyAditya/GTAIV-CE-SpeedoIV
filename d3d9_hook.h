@@ -26,23 +26,49 @@ inline RenderCallback g_callback = nullptr;
 
 namespace detail {
     typedef HRESULT (__stdcall *EndScene_t)(IDirect3DDevice9*);
+    typedef HRESULT (__stdcall *Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+    typedef HRESULT (__stdcall *Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
     inline EndScene_t g_origEndScene = nullptr;
+    inline Reset_t    g_origReset    = nullptr;
+    inline Present_t  g_origPresent  = nullptr;
+    inline bool g_hookPresent = false;  /* true if we hooked Present instead of EndScene */
     inline IDirect3DDevice9** g_ppDevice = nullptr;
 
-    /* Exported so external patchers can find this function by name */
+    /* User callback for device-lost notification */
+    typedef void (*LostCallback)();
+    inline LostCallback g_lostCallback = nullptr;
+
+    /* EndScene hook */
     extern "C" __declspec(dllexport) HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDev) {
         if (g_callback) g_callback(pDev);
         if (g_origEndScene) return g_origEndScene(pDev);
         return S_OK;
     }
 
-    /* Exported setter so external patcher can install the original function pointer */
+    /* Present hook (5 params) */
+    extern "C" __declspec(dllexport) HRESULT __stdcall HookedPresent(
+            IDirect3DDevice9* pDev, const RECT* src, const RECT* dst,
+            HWND hWnd, const RGNDATA* dirty) {
+        if (g_callback) g_callback(pDev);
+        if (g_origPresent) return g_origPresent(pDev, src, dst, hWnd, dirty);
+        return S_OK;
+    }
+
+    /* Reset hook - release resources */
+    extern "C" __declspec(dllexport) HRESULT __stdcall HookedReset(
+            IDirect3DDevice9* pDev, D3DPRESENT_PARAMETERS* pp) {
+        if (g_lostCallback) g_lostCallback();
+        if (g_origReset) return g_origReset(pDev, pp);
+        return S_OK;
+    }
+
     extern "C" __declspec(dllexport) void SetOrigEndScene(void* fn) {
         g_origEndScene = (EndScene_t)fn;
     }
 }
 
 inline void SetCallback(RenderCallback cb) { g_callback = cb; }
+inline void SetLostCallback(detail::LostCallback cb) { detail::g_lostCallback = cb; }
 
 /*
  * Find the game's device pointer and hook EndScene on its vtable.
@@ -106,21 +132,34 @@ inline bool Install(uintptr_t gameBase, size_t gameSize) {
         return false;
     }
 
-    /* Hook EndScene (vt[42]) on the wrapper. When the game's render code
-     * calls EndScene through the wrapper, our hook fires. The wrapper then
-     * delegates to the real DXVK device. */
+    /* Hook EndScene -- fires every frame on the game's RAGE wrapper */
+    int hookIdx = 42; /* EndScene */
+    sdk::Log("d3d9hook: Hooking vtable[%d] (EndScene)", hookIdx);
+
     DWORD oldProt;
-    if (!VirtualProtect(&foundVt[42], 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+    if (!VirtualProtect(&foundVt[hookIdx], 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
         sdk::Log("d3d9hook: VirtualProtect failed");
         return false;
     }
-    detail::g_origEndScene = (detail::EndScene_t)foundVt[42];
-    foundVt[42] = (void*)detail::HookedEndScene;
-    VirtualProtect(&foundVt[42], 4, oldProt, &oldProt);
+    if (hookIdx == 17) {
+        detail::g_hookPresent = true;
+        detail::g_origPresent = (detail::Present_t)foundVt[hookIdx];
+        foundVt[hookIdx] = (void*)detail::HookedPresent;
+    } else {
+        detail::g_origEndScene = (detail::EndScene_t)foundVt[hookIdx];
+        foundVt[hookIdx] = (void*)detail::HookedEndScene;
+    }
+    VirtualProtect(&foundVt[hookIdx], 4, oldProt, &oldProt);
 
-    sdk::Log("d3d9hook: Hooked wrapper EndScene! orig=0x%08X new=0x%08X",
-             (unsigned)(uintptr_t)detail::g_origEndScene,
-             (unsigned)(uintptr_t)detail::HookedEndScene);
+    /* Hook Reset (vtable[16]) */
+    if (VirtualProtect(&foundVt[16], 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        detail::g_origReset = (detail::Reset_t)foundVt[16];
+        foundVt[16] = (void*)detail::HookedReset;
+        VirtualProtect(&foundVt[16], 4, oldProt, &oldProt);
+        sdk::Log("d3d9hook: Hooked Reset orig=0x%08X", (unsigned)(uintptr_t)detail::g_origReset);
+    }
+
+    sdk::Log("d3d9hook: Hook installed");
     return true;
 }
 

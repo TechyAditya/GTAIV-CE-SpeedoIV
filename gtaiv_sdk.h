@@ -40,6 +40,10 @@ inline void LogOpen(const char* filename) {
 
 inline void Log(const char* fmt, ...) {
     if (!g_log) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_log, "[%02d:%02d:%02d.%03d] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     va_list ap; va_start(ap, fmt);
     vfprintf(g_log, fmt, ap);
     va_end(ap);
@@ -152,8 +156,61 @@ namespace player {
     static const int NUM_VEL = sizeof(VEL_OFFSETS) / sizeof(int);
 
     /* Validate a candidate CPedFactory global address.
-     * We REQUIRE a non-zero velocity reading to accept it -- this filters out
-     * stale/dummy ped pointers that happen to look valid. */
+     * Returns the best speed reading found (or -1 if invalid).
+     * Side-effect: sets g_pedFactory/g_vehOffset/g_velOffset to BEST result. */
+    inline float TryFactoryStrictScored(uintptr_t ptrAddr, uintptr_t gameBase, size_t gameSize) {
+        if (!IsValidPtr(ptrAddr)) return -1;
+        uintptr_t fp = 0;
+        if (!ReadPtr(ptrAddr, &fp) || !IsHeapPtr(fp)) return -1;
+        uintptr_t vt = 0;
+        if (!ReadPtr(fp, &vt) || !IsValidPtr(vt)) return -1;
+        uintptr_t ped = 0;
+        if (!ReadPtr(fp + PED_FACTORY_PLAYER_OFF, &ped) || !IsHeapPtr(ped)) return -1;
+        uintptr_t pedVt = 0;
+        if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return -1;
+        if (pedVt < gameBase || pedVt >= gameBase + gameSize) return -1;
+
+        float bestSpeed = -1;
+        int bestVehOff = 0, bestVelOff = 0;
+        for (int v = 0; v < NUM_VEH; v++) {
+            uintptr_t veh = 0;
+            if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
+            if (veh == 0 || !IsHeapPtr(veh)) continue;
+            uintptr_t vehVt = 0;
+            if (!ReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
+            if (vehVt < gameBase || vehVt >= gameBase + gameSize) continue;
+
+            for (int vi = 0; vi < NUM_VEL; vi++) {
+                float vx, vy, vz;
+                uintptr_t vb = veh + VEL_OFFSETS[vi];
+                if (ReadFloat(vb, &vx) && ReadFloat(vb+4, &vy) && ReadFloat(vb+8, &vz)) {
+                    float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
+                    if (s > 0.1f && s <= 500.0f && s > bestSpeed) {
+                        bestSpeed = s;
+                        bestVehOff = VEH_OFFSETS[v];
+                        bestVelOff = VEL_OFFSETS[vi];
+                    }
+                }
+            }
+        }
+        if (bestSpeed > 0) {
+            g_pedFactory = ptrAddr;
+            g_vehOffset = bestVehOff;
+            g_velOffset = bestVelOff;
+            g_ready = true;
+        }
+        return bestSpeed;
+    }
+
+    /* Validate a candidate CPedFactory global address.
+     * We REQUIRE the vehicle's vtable to be inside GTAIV.exe (real RAGE vehicle)
+     * AND a non-zero velocity reading to filter out stale/dummy peds. */
+    inline bool TryFactoryStrict(uintptr_t ptrAddr, uintptr_t gameBase, size_t gameSize) {
+        return TryFactoryStrictScored(ptrAddr, gameBase, gameSize) > 0;
+    }
+
+    /* Validate a candidate CPedFactory global address.
+     * Accepts any candidate where ped is in heap AND has vehicle. */
     inline bool TryFactory(uintptr_t ptrAddr) {
         if (!IsValidPtr(ptrAddr)) return false;
         uintptr_t fp = 0;
@@ -165,22 +222,19 @@ namespace player {
         uintptr_t pedVt = 0;
         if (!ReadPtr(ped, &pedVt) || !IsValidPtr(pedVt)) return false;
 
-        /* Try each veh offset; require valid vehicle with sensible velocity at SOME offset */
         for (int v = 0; v < NUM_VEH; v++) {
             uintptr_t veh = 0;
             if (!ReadPtr(ped + VEH_OFFSETS[v], &veh)) continue;
-            if (veh == 0) continue; /* on foot - skip, look for in-vehicle match */
+            if (veh == 0) continue;
             if (!IsHeapPtr(veh)) continue;
             uintptr_t vehVt = 0;
             if (!ReadPtr(veh, &vehVt) || !IsValidPtr(vehVt)) continue;
 
-            /* Validate velocity at each candidate offset */
             for (int vi = 0; vi < NUM_VEL; vi++) {
                 float vx, vy, vz;
                 uintptr_t vb = veh + VEL_OFFSETS[vi];
                 if (ReadFloat(vb, &vx) && ReadFloat(vb+4, &vy) && ReadFloat(vb+8, &vz)) {
                     float s = sqrtf(vx*vx + vy*vy + vz*vz) * 3.6f;
-                    /* Accept ANY reasonable speed (including 0 if all 3 floats are exactly 0) */
                     if (s >= 0.0f && s <= 500.0f && (vx != 0.0f || vy != 0.0f || vz != 0.0f)) {
                         g_pedFactory = ptrAddr; g_vehOffset = VEH_OFFSETS[v];
                         g_velOffset = VEL_OFFSETS[vi]; g_ready = true;
@@ -215,9 +269,8 @@ namespace player {
         return false;
     }
 
-    /* Scan game memory for CPedFactory. Call after game is loaded.
-     * Two-pass: first prefer factories with active vehicle+velocity, 
-     * then fall back to on-foot detection. */
+    /* Scan game memory for CPedFactory. Scores ALL candidates and picks
+     * the one with the highest reported speed (= real moving player). */
     inline bool Init(uintptr_t gameBase, size_t gameSize) {
         if (g_ready) return true;
 
@@ -228,11 +281,46 @@ namespace player {
             { {0x8B,0x35,0,0,0,0,0x85,0xF6,0x74}, "xx????xxx", 2 },
         };
 
-        /* Pass 1: strict - require non-zero velocity (proves player is driving) */
+        /* Pass 1: SCORED STRICT - find the candidate with the highest speed */
+        uintptr_t bestFactory = 0;
+        int bestVeh = 0, bestVel = 0;
+        float bestScore = 0.0f;
+
         for (auto& p : patterns) {
             uintptr_t cur = gameBase;
             size_t rem = gameSize;
-            for (int n = 0; n < 200 && cur < gameBase + gameSize - 9; n++) {
+            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
+                uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
+                if (!hit) break;
+                uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
+                /* Test factory without committing */
+                float s = TryFactoryStrictScored(candidate, gameBase, gameSize);
+                if (s > bestScore) {
+                    bestScore = s;
+                    bestFactory = g_pedFactory;
+                    bestVeh = g_vehOffset;
+                    bestVel = g_velOffset;
+                    /* Reset ready flag - we'll commit best at end */
+                    g_ready = false;
+                }
+                cur = hit + 1;
+                rem = gameBase + gameSize - cur;
+            }
+        }
+
+        if (bestFactory != 0) {
+            g_pedFactory = bestFactory;
+            g_vehOffset = bestVeh;
+            g_velOffset = bestVel;
+            g_ready = true;
+            return true;
+        }
+
+        /* Pass 2: non-zero velocity (less strict, any heap factory) */
+        for (auto& p : patterns) {
+            uintptr_t cur = gameBase;
+            size_t rem = gameSize;
+            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
                 uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
                 if (!hit) break;
                 uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);
@@ -242,11 +330,11 @@ namespace player {
             }
         }
 
-        /* Pass 2: fallback - accept on-foot state */
+        /* Pass 3: fallback - on-foot */
         for (auto& p : patterns) {
             uintptr_t cur = gameBase;
             size_t rem = gameSize;
-            for (int n = 0; n < 200 && cur < gameBase + gameSize - 9; n++) {
+            for (int n = 0; n < 10000 && cur < gameBase + gameSize - 9; n++) {
                 uintptr_t hit = FindPattern(cur, rem, p.pat, p.mask);
                 if (!hit) break;
                 uintptr_t candidate = *(uintptr_t*)(hit + p.addrOff);

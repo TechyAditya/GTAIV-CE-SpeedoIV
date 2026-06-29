@@ -93,9 +93,16 @@ static void LoadConfig() {
     GetPrivateProfileStringA("Config", "SkinFolder", "Default", g_cfg.skin, 64, ini);
     GetPrivateProfileStringA("Config", "ScreenAlign", "BL", g_cfg.align, 4, ini);
 
-    g_visible = g_cfg.autostart;
-    sdk::Log("Config loaded: autostart=%d kmh=%d maxSpeed=%.0f skin=%s align=%s",
-             g_cfg.autostart, g_cfg.kmh, g_cfg.maxSpeed, g_cfg.skin, g_cfg.align);
+    /* Quiet by default - only log once at startup */
+    static bool firstLoad = true;
+    if (firstLoad) {
+        g_visible = g_cfg.autostart;
+        sdk::Log("Config loaded: autostart=%d kmh=%d maxSpeed=%.0f skin=%s align=%s size=%.0fx%.0f pos=%.1f,%.1f",
+                 g_cfg.autostart, g_cfg.kmh, g_cfg.maxSpeed, g_cfg.skin, g_cfg.align,
+                 g_cfg.sizeX, g_cfg.sizeY, g_cfg.posX, g_cfg.posY);
+        firstLoad = false;
+    }
+    /* Don't overwrite g_visible on reload -- user F5 toggle should persist */
 }
 
 /* ==========================================================================
@@ -110,23 +117,34 @@ static bool InitResources(IDirect3DDevice9* dev) {
     s = strrchr(base, '\\'); if (s) *s = 0;
 
     char bck[MAX_PATH], pin[MAX_PATH];
+    /* Use the modern skin textures */
     snprintf(bck, MAX_PATH, "%s\\SpeedoIV\\%s\\Bck.png", base, g_cfg.skin);
     snprintf(pin, MAX_PATH, "%s\\SpeedoIV\\%s\\Pin.png", base, g_cfg.skin);
+    sdk::Log("Loading bck: %s", bck);
+    sdk::Log("Loading pin: %s", pin);
 
     if (FAILED(D3DXCreateSprite(dev, &g_sprite))) {
         sdk::Log("Failed: D3DXCreateSprite"); return false;
     }
+    /* Load textures preserving original format, with D3DPOOL_DEFAULT for DXVK */
     if (FAILED(D3DXCreateTextureFromFileExA(dev, bck,
-            (UINT)g_cfg.texSizeX, (UINT)g_cfg.texSizeY, 1, 0,
-            D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
-            D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &g_texBck))) {
+            D3DX_DEFAULT, D3DX_DEFAULT, 1, 0,
+            D3DFMT_UNKNOWN, D3DPOOL_DEFAULT,
+            D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &g_texBck))) {
         sdk::Log("Failed: load %s", bck); return false;
     }
     if (FAILED(D3DXCreateTextureFromFileExA(dev, pin,
-            (UINT)g_cfg.texSizeX, (UINT)g_cfg.texSizeY, 1, 0,
-            D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
-            D3DX_FILTER_LINEAR, D3DX_FILTER_LINEAR, 0, NULL, NULL, &g_texPin))) {
+            D3DX_DEFAULT, D3DX_DEFAULT, 1, 0,
+            D3DFMT_UNKNOWN, D3DPOOL_DEFAULT,
+            D3DX_DEFAULT, D3DX_DEFAULT, 0, NULL, NULL, &g_texPin))) {
         sdk::Log("Failed: load %s", pin); return false;
+    }
+    /* Get texture dimensions to use as texSize (auto-detect) */
+    D3DSURFACE_DESC desc;
+    if (SUCCEEDED(g_texBck->GetLevelDesc(0, &desc))) {
+        sdk::Log("Bck texture: %dx%d format=%d", desc.Width, desc.Height, desc.Format);
+        g_cfg.texSizeX = (float)desc.Width;
+        g_cfg.texSizeY = (float)desc.Height;
     }
     D3DXCreateFontA(dev, 22, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET,
                     OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
@@ -148,60 +166,119 @@ static void ReleaseResources() {
 /* ==========================================================================
  * Render
  * ========================================================================== */
+static IDirect3DDevice9* g_lastDev = NULL;
+
 static void Render(IDirect3DDevice9* dev, float speed) {
+    /* Check device state - DXVK reports DEVICELOST on alt+tab from fullscreen */
+    HRESULT coop = dev->TestCooperativeLevel();
+    if (coop == D3DERR_DEVICELOST) {
+        if (g_resOk) { sdk::Log("Device lost - releasing"); ReleaseResources(); }
+        return;
+    }
+    if (coop == D3DERR_DEVICENOTRESET) return;
+
+    /* Get the device's focus window from its swapchain - if it's not 
+     * visible/active, skip rendering to avoid DXVK crashes */
+    IDirect3DSwapChain9* swap = NULL;
+    if (SUCCEEDED(dev->GetSwapChain(0, &swap))) {
+        D3DPRESENT_PARAMETERS pp = {};
+        swap->GetPresentParameters(&pp);
+        swap->Release();
+        if (pp.hDeviceWindow) {
+            if (!IsWindowVisible(pp.hDeviceWindow) || IsIconic(pp.hDeviceWindow)) {
+                if (g_resOk) { sdk::Log("Window hidden - releasing"); ReleaseResources(); }
+                return;
+            }
+        }
+    }
+
+    /* Device change detection */
+    if (dev != g_lastDev) {
+        if (g_lastDev != NULL && g_resOk) ReleaseResources();
+        g_lastDev = dev;
+    }
+
     if (!InitResources(dev)) return;
+
+    /* Force clean render states - GTA leaves the device in weird state after
+     * its rendering passes (tonemap, depth-of-field). Reset to defaults. */
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    /* Disable any pixel shaders that might be active */
+    dev->SetPixelShader(NULL);
+    dev->SetVertexShader(NULL);
+    /* Reset texture stage state */
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
 
     D3DVIEWPORT9 vp;
     dev->GetViewport(&vp);
     float scrW = (float)vp.Width, scrH = (float)vp.Height;
 
-    /* Position */
+    /* Position with intuitive offsets:
+     * - For BL/BR: posY moves UP from bottom (positive = up), posX moves RIGHT for BL or LEFT for BR
+     * - For TL/TR: posY moves DOWN from top */
     float drawX, drawY;
     if (g_cfg.align[0] == 'B' || g_cfg.align[0] == 'b')
-        drawY = scrH - g_cfg.sizeY + g_cfg.posY;
+        drawY = scrH - g_cfg.sizeY - g_cfg.posY;
     else
         drawY = g_cfg.posY;
     if (g_cfg.align[1] == 'R' || g_cfg.align[1] == 'r')
-        drawX = scrW - g_cfg.sizeX + g_cfg.posX;
+        drawX = scrW - g_cfg.sizeX - g_cfg.posX;
     else
         drawX = g_cfg.posX;
 
-    /* Needle angle: 0 -> -135deg, max -> +135deg (270deg sweep) */
+    /* Pin already points at the "0" position in the texture.
+     * Rotate it clockwise from 0 (speed=0) to +270deg (speed=maxSpeed). */
     float ratio = speed / g_cfg.maxSpeed;
     if (ratio > 1.f) ratio = 1.f;
-    float needle = (-135.f + ratio * 270.f) * (float)M_PI / 180.f;
+    float needle = ratio * 270.f * (float)M_PI / 180.f;
 
-    D3DXVECTOR2 center(g_cfg.sizeX / 2.f, g_cfg.sizeY / 2.f);
+    /* Use texture-pixel center for scaling and rotation pivots so that
+     * a (texSize/2, texSize/2) point in the texture is at the screen position
+     * (drawX + sizeX/2, drawY + sizeY/2) after scaling. */
+    D3DXVECTOR2 scalingCenter(0.f, 0.f);
+    D3DXVECTOR2 rotCenter(g_cfg.texSizeX / 2.f, g_cfg.texSizeY / 2.f);
     D3DXVECTOR2 pos(drawX, drawY);
     D3DXVECTOR2 scale(g_cfg.sizeX / g_cfg.texSizeX, g_cfg.sizeY / g_cfg.texSizeY);
     DWORD color = D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255);
 
+    /* Use ALPHABLEND but no SORT_TEXTURE which may interfere with DXVK */
     g_sprite->Begin(D3DXSPRITE_ALPHABLEND);
 
-    /* Background */
+    /* Background - explicit white color, full alpha to test rendering */
+    DWORD bgColor = D3DCOLOR_ARGB(255, 255, 255, 255);
+    DWORD pinColor = D3DCOLOR_ARGB(255, 255, 255, 255);
+
     D3DXMATRIX mat;
-    D3DXMatrixTransformation2D(&mat, &center, 0.f, &scale, &center,
+    D3DXMatrixTransformation2D(&mat, &scalingCenter, 0.f, &scale, &rotCenter,
                                 g_cfg.angle * (float)M_PI / 180.f, &pos);
     g_sprite->SetTransform(&mat);
-    g_sprite->Draw(g_texBck, NULL, NULL, NULL, color);
+    g_sprite->Draw(g_texBck, NULL, NULL, NULL, bgColor);
 
     /* Needle */
-    D3DXMatrixTransformation2D(&mat, &center, 0.f, &scale, &center,
+    D3DXMatrixTransformation2D(&mat, &scalingCenter, 0.f, &scale, &rotCenter,
                                 needle + g_cfg.angle * (float)M_PI / 180.f, &pos);
     g_sprite->SetTransform(&mat);
-    g_sprite->Draw(g_texPin, NULL, NULL, NULL, color);
+    g_sprite->Draw(g_texPin, NULL, NULL, NULL, pinColor);
 
     g_sprite->End();
-
-    /* Digital readout */
-    if (g_font) {
-        char buf[32];
-        snprintf(buf, 32, "%d", (int)speed);
-        RECT rc = { (LONG)(drawX + center.x - 30), (LONG)(drawY + center.y + 25),
-                    (LONG)(drawX + center.x + 30), (LONG)(drawY + center.y + 55) };
-        g_font->DrawTextA(NULL, buf, -1, &rc, DT_CENTER | DT_NOCLIP,
-                          D3DCOLOR_ARGB(g_cfg.alpha, 255, 255, 255));
-    }
 }
 
 /* ==========================================================================
@@ -222,20 +299,38 @@ static void OnFrame(IDirect3DDevice9* dev) {
                  sdk::player::g_vehOffset, sdk::player::g_velOffset);
     }
 
-    /* Re-scan periodically if we don't have a vehicle reading yet -- 
-     * the player might not have been in a car when we first scanned. */
+    /* Live-reload Config.ini every ~1 second so you can tune without restarting */
+    static int reloadFrame = 0;
+    if (++reloadFrame % 60 == 0) {
+        LoadConfig();
+    }
+
+    /* Re-scan if we're locked on a wrong factory (always reads near-zero in vehicle).
+     * If speed stays under 1 km/h for > 600 frames (~10s), re-scan. */
     static int rescanFrame = 0;
-    if (sdk::player::g_ready && ++rescanFrame % 600 == 0) {
-        /* Try if current pointer still gives valid speed; if not, re-scan */
+    static int lowSpeedFrames = 0;
+    static int highSpeedFrames = 0;
+    if (sdk::player::g_ready) {
         float s = sdk::player::GetSpeed();
         if (s < 0.0f) {
-            /* Reset and re-scan */
-            sdk::player::g_ready = false;
-            auto mod = sdk::GetGameModule();
-            if (mod.valid) sdk::player::Init(mod.base, mod.size);
-            sdk::Log("Re-scan: ready=%d factory=0x%08X vehOff=0x%X velOff=0x%X",
-                     sdk::player::g_ready, (unsigned)sdk::player::g_pedFactory,
-                     sdk::player::g_vehOffset, sdk::player::g_velOffset);
+            lowSpeedFrames = 0; highSpeedFrames = 0;
+        } else if (s < 1.0f) {
+            lowSpeedFrames++;
+            if (lowSpeedFrames > 600 && highSpeedFrames < 5) {
+                /* Stuck at near-zero with no real movement detected -- wrong factory */
+                if (++rescanFrame % 120 == 0) {
+                    sdk::player::g_ready = false;
+                    auto mod = sdk::GetGameModule();
+                    if (mod.valid) sdk::player::Init(mod.base, mod.size);
+                    sdk::Log("Re-scan (stuck low): factory=0x%08X vehOff=0x%X velOff=0x%X",
+                             (unsigned)sdk::player::g_pedFactory,
+                             sdk::player::g_vehOffset, sdk::player::g_velOffset);
+                    lowSpeedFrames = 0;
+                }
+            }
+        } else {
+            highSpeedFrames++;
+            lowSpeedFrames = 0;
         }
     }
 
@@ -284,6 +379,13 @@ static DWORD WINAPI InitThread(LPVOID) {
     return 0;
 }
 
+/* Called by hook when the device is being reset (e.g. alt+tab) */
+static void OnDeviceLost() {
+    sdk::Log("Device reset detected - releasing resources");
+    ReleaseResources();
+    g_lastDev = NULL;
+}
+
 /* ==========================================================================
  * Entry Point
  * ========================================================================== */
@@ -292,6 +394,7 @@ extern "C" BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         d3d9hook::SetCallback(OnFrame);
+        d3d9hook::SetLostCallback(OnDeviceLost);
         CreateThread(NULL, 0, InitThread, NULL, 0, NULL);
     } else if (reason == DLL_PROCESS_DETACH) {
         ReleaseResources();

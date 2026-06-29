@@ -6,3 +6,5 @@
 *.log
 *.pdb
 build/
+ENVIRONMENT.md
+deploy.ps1
