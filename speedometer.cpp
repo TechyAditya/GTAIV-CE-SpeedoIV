@@ -71,11 +71,18 @@ static void LoadConfig() {
         return (float)atof(buf);
     };
 
-    g_cfg.autostart = GetPrivateProfileIntA("Config", "Autostart", 1, ini) != 0;
+    auto getBool = [&](const char* key, bool def) -> bool {
+        char buf[16];
+        GetPrivateProfileStringA("Config", key, def ? "true" : "false", buf, 16, ini);
+        return (_stricmp(buf, "true") == 0 || _stricmp(buf, "1") == 0 ||
+                _stricmp(buf, "yes") == 0);
+    };
+
+    g_cfg.autostart = getBool("Autostart", true);
     g_cfg.toggleKey = GetPrivateProfileIntA("Config", "ToggleKey", VK_F5, ini);
     g_cfg.texSizeX  = getF("TexSizeX", 300.f);
     g_cfg.texSizeY  = getF("TexSizeY", 300.f);
-    g_cfg.kmh       = GetPrivateProfileIntA("Config", "EnableKMH", 1, ini) != 0;
+    g_cfg.kmh       = getBool("EnableKMH", true);
     g_cfg.maxSpeed  = getF("MaxSpeed", 300.f);
     g_cfg.posX      = getF("PositionX", 26.5f);
     g_cfg.posY      = getF("PositionY", -3.f);
@@ -87,7 +94,8 @@ static void LoadConfig() {
     GetPrivateProfileStringA("Config", "ScreenAlign", "BL", g_cfg.align, 4, ini);
 
     g_visible = g_cfg.autostart;
-    sdk::Log("Config loaded: kmh=%d maxSpeed=%.0f skin=%s", g_cfg.kmh, g_cfg.maxSpeed, g_cfg.skin);
+    sdk::Log("Config loaded: autostart=%d kmh=%d maxSpeed=%.0f skin=%s align=%s",
+             g_cfg.autostart, g_cfg.kmh, g_cfg.maxSpeed, g_cfg.skin, g_cfg.align);
 }
 
 /* ==========================================================================
