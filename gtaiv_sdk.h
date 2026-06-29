@@ -153,16 +153,20 @@ namespace player {
 
     inline FindFn   g_findPlayerPed     = nullptr;
     inline FindFn   g_findPlayerVehicle = nullptr;
-    inline int      g_velOffset         = 0xF8;  /* CVehicle::m_vecMoveSpeed on CE 1.2.0.43
-                                                  * (verified by probe_vehicle.exe live dump) */
+    inline int      g_velOffset         = 0x1270; /* CVehicle::m_vecMoveSpeed on CE 1.2.0.43
+                                                   * (verified by probe_dynamic.exe -- value
+                                                   * tracked live driving 60.78 -> 64.75 -> 63.95
+                                                   * km/h over 2s while previous candidate 0xF8
+                                                   * stayed at constant 38, never moving with speed) */
     inline bool     g_ready             = false;
     inline uintptr_t g_gameBase = 0;
     inline size_t    g_gameSize = 0;
 
     /* Probe a few candidate velocity offsets and pick the one whose
      * vector magnitude looks like a believable speed (-> [0, 500] km/h).
-     * Tries 0xF8 first (CE verified) then a few alternates. */
-    static const int VEL_CANDIDATES[] = { 0xF8, 0x80, 0x70, 0x90, 0xA0, 0xB0, 0xC0, 0x60, 0x100 };
+     * Tries 0x1270 first (CE verified). 0xF8 is intentionally excluded
+     * -- it is a stationary engine-state scalar, not velocity. */
+    static const int VEL_CANDIDATES[] = { 0x1270 };
     static const int NUM_VEL_CANDS = sizeof(VEL_CANDIDATES) / sizeof(int);
 
     inline float ReadSpeedAt(uintptr_t veh, int off) {
@@ -211,16 +215,14 @@ namespace player {
     }
 
     /* Auto-pick the right velocity offset the first time a moving vehicle
-     * is seen. After that g_velOffset stays locked. */
+     * is seen. After that g_velOffset stays locked.
+     * With only 1 candidate (CE 0x1270), this is essentially a no-op
+     * confirmation step. Kept for forward-compat with other game builds. */
     inline void MaybeRebindVelOffset(uintptr_t veh) {
         static bool locked = false;
         if (locked) return;
         float curSpeed = ReadSpeedAt(veh, g_velOffset);
-        if (curSpeed > 0.5f && curSpeed < 500.f) {
-            locked = true;   /* current offset is producing real speed */
-            return;
-        }
-        /* Try every candidate and lock onto the first that reports motion. */
+        if (curSpeed > 0.5f && curSpeed < 500.f) { locked = true; return; }
         for (int i = 0; i < NUM_VEL_CANDS; i++) {
             float s = ReadSpeedAt(veh, VEL_CANDIDATES[i]);
             if (s > 0.5f && s < 500.f) {
@@ -229,8 +231,6 @@ namespace player {
                 return;
             }
         }
-        /* Nothing reads as moving -- vehicle is stationary or we haven't
-         * found the right offset yet. Leave g_velOffset at default. */
     }
 
     /* Get current vehicle speed in km/h. Returns -1 if on foot. */

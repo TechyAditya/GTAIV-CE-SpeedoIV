@@ -361,3 +361,41 @@ black until you drove again, and toggling F6 didn't help.
 **Fix**: Always call `Render()` when `g_visible` is set. Clamp
 `speed = 0` when `GetSpeed()` returns negative so the dial shows
 a sensible idle reading. Resource re-init runs every frame as needed.
+
+---
+
+## 20. Velocity offset was wrong: 0xF8 vs 0x1270
+
+**Finding**: Setting `g_velOffset = 0xF8` (based on the static probe
+that captured a 38 km/h reading at +0xF8 while we were driving ~38
+km/h) produced a needle that appeared to track speed, but actually
+was stuck on a stale engine-state scalar. Symptoms: needle showed
+~38 while sitting in the car, ~28 mid-exit, 0 on foot, but NEVER
+changed while actively driving.
+
+**Root cause**: `vehicle+0xF8` is a (component-only-X) scalar that
+correlates with engine state but does not equal velocity. The first
+probe captured it by coincidence -- our filter only looked at static
+triplets in the first sample and called magnitude == 38.12 km/h a
+match because the user was driving 38 km/h at that exact moment.
+Confirmation bias struck.
+
+**Diagnosis**: `probe_dynamic.exe -snap` captured 3 snapshots 1s
+apart while driving, then enumerated every 4-byte float triplet
+inside the vehicle struct AND every sub-object pointed to by the
+vehicle. The per-sample magnitude trace revealed that ONLY `+0x1270`
+moved with real velocity (60.78 -> 64.75 -> 63.95 km/h). All other
+"velocity-looking" offsets stayed flat across samples.
+
+**Fix**: `g_velOffset = 0x1270`. Removed 0xF8 from the candidate
+list to prevent regression. Auto-detect now has only the verified
+CE offset.
+
+**Lessons**:
+- Single-snapshot probes pick up coincidental matches. Always
+  capture multiple samples to verify a value is **changing** with
+  the variable you care about.
+- Trust per-sample variance more than absolute magnitudes.
+- Sub-object scan is critical: GTAIV's CVehicle has nested
+  CPhysical-derived data that's reached via internal pointers --
+  velocity often lives in one of those, not in the parent struct.
